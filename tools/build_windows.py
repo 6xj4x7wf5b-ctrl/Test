@@ -37,8 +37,10 @@ def run_logged(command, name, *, env):
             for line in process.stdout:
                 print(line, end="", flush=True)
                 log.write(line)
-            if process.wait() != 0:
-                raise RuntimeError(f"{name} failed; see {log.name}")
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(f"{name} failed with exit code {return_code} "
+                                   f"(0x{return_code & 0xFFFFFFFF:08X}); see {log.name}")
 
 
 def check_windows_exe(path):
@@ -123,7 +125,7 @@ def main():
     print("Creating isolated Windows build environment...", flush=True)
     venv.EnvBuilder(with_pip=True, clear=True).create(environment)
     python = environment / "Scripts" / "python.exe"
-    run_logged([python, "-m", "pip", "install", ".[dev]"], "dependencies", env=env)
+    run_logged([python, "-m", "pip", "install", "-c", "requirements-windows-build.txt", ".[dev]"], "dependencies", env=env)
     run_logged([python, "-m", "pip", "check"], "dependency-check", env=env)
     run_logged([python, "-m", "pytest", "-q", "--junitxml", EVIDENCE / "test-results.xml"], "tests", env=env)
     run_logged([python, "-m", "PyInstaller", "--noconfirm", "--clean", "WarehouseTemperatureConsole.spec"], "pyinstaller", env=env)
