@@ -1,6 +1,6 @@
 # 利仓上位机
 
-Windows 11 离线串口上位机，使用 Python 3.11、PySide6、PyQtGraph 和 SQLite；当前在 macOS 开发、运行模拟测试。**尚未生成 Windows EXE，也未完成实机验收。** 运行时不依赖原网页服务。
+Windows 11 离线串口上位机，使用 Python 3.11、PySide6、PyQtGraph 和 SQLite；在 macOS 开发。**Windows x64 便携包已于 2026-11-09 在云端构建，并通过正常/演示模式启动检查；设备实物与目标 Windows 11 电脑尚未验收。** 运行时不依赖原网页服务。
 
 首版提供仓房/分机管理、多串口采集、探头登记、温湿度微调、超限声音报警、本地历史与备份。登录、园区管理、通风控制、注册码及授权激活未纳入首版。
 
@@ -48,7 +48,9 @@ python -m warehouse_pc --demo --data-dir /path/to/warehouse-data
 
 云端依次执行：创建独立 Python 环境 → 安装依赖 → 自动化测试 → PyInstaller 打包 → 检查 Windows x64 EXE 格式 → 启动正常/演示模式并检查截图和数据库 → 生成 ZIP 与校验值。日志、测试报告和启动截图可从 `windows-build-evidence` 下载。POSIX 伪终端测试在 Windows 下跳过，仍需用实际串口验收。
 
-**工作流已配置不代表 EXE 已生成。当前尚未执行 Windows 云端构建，尚无验证通过的 Windows 发布包。** 云端结果以该次 Actions 运行和包内的 `build-info.json` 为准；项目根目录 `output/desktop/build-info.json` 是旧的 macOS 开发记录。
+**已完成构建：** [2026-11-09 Windows Build](https://github.com/6xj4x7wf5b-ctrl/Test/actions/runs/42601995707)，源码提交 `117e6cb38c724aff422ff53ac13dde8459e642e9`。Windows 自动测试 71 项及 15 项子检查通过，1 项 POSIX 伪终端测试按平台跳过；成品 EXE 的正常和演示模式均正常启动、截图并退出。运行包已下载到完整项目的 `output/desktop/windows-release-0.1.0/`。云端构建使用 Windows Server 2022，目标 Windows 11 实机验收仍需现场完成。
+
+云端结果以该次 Actions 运行和包内的 `build-info.json` 为准；项目根目录 `output/desktop/build-info.json` 是旧的 macOS 开发记录。构建依赖由 `requirements-windows-build.txt` 锁定，避免未验证的 Qt/测试工具升级影响发布。Actions 下载附件保留 7 天，本地运行包可长期保存。
 
 ### 有 Windows 环境：本地打包
 
