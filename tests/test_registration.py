@@ -179,9 +179,11 @@ class RegistrationTests(unittest.TestCase):
         self.assertFalse(any(request[2] == 5 for request in self.manager.requests))
 
     def test_save_writes_only_changes_and_reads_back_swap(self):
+        self.assertEqual(self.dialog.summary_label.text(), "已保存 170 条")
         before = self.dialog._active
         draft = [dict(before[0], rom=before[1]["rom"]), dict(before[1], rom=before[0]["rom"]), *before[2:]]
         self.dialog._edit(draft, "交换两个探头")
+        self.assertEqual(self.dialog.summary_label.text(), "已保存 170 条 · 未保存 2 项")
         saved = []
         self.dialog.bindings_saved.connect(saved.append)
         self.dialog.save()
@@ -190,6 +192,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual([request[2] for request in mutations], [4, 4, 3, 3, 5])
         self.assertEqual(saved[0]["bindings"], draft)
         self.assertFalse(self.dialog.dirty)
+        self.assertEqual(self.dialog.summary_label.text(), "已保存 170 条")
         self.assertEqual(self.dialog.binding_table.item(0, 3).text(), "已保存")
 
     def test_stage_timeout_uses_readonly_recovery_without_committing(self):

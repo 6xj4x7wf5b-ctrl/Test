@@ -3,9 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QPoint, Qt, Signal
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QMessageBox
 
+from warehouse_pc.app import MainWindow
 from warehouse_pc.controller import Controller as AppController
 from warehouse_pc.history_ui import HistoryPage
 from warehouse_pc.maintenance_ui import MaintenancePage
@@ -78,6 +80,7 @@ def test_parameter_loading_gates_editing_and_ignores_old_device_results(qt_appli
     page._save_intervals()
     assert all(not entry[0].startswith("save_") for entry in repo.calls)
     page.device_combo.setCurrentIndex(1)
+    assert page.alarm_device_combo.currentData() == 2
     repo.respond("calibrations", [{"kind": "grain", "point": 1, "temp_offset": 9}], args=(1,))
     assert not page.temp_offset.isEnabled()
     repo.respond("calibrations", [{"kind": "grain", "point": 1, "temp_offset": 1.5}], args=(2,))
@@ -101,9 +104,12 @@ def test_unsaved_device_change_and_batch_calibration_confirm_affected_points(qt_
     repo.respond("calibrations", [])
     repo.respond("thresholds", [])
     page.temp_offset.setValue(1.5)
+    page.set_tab(2)
     with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Cancel):
-        page.device_combo.setCurrentIndex(1)
+        page.alarm_device_combo.setCurrentIndex(1)
+    assert page.alarm_device_combo.currentData() == 1
     assert page.device_combo.currentData() == 1
+    page.set_tab(1)
     assert page.temp_offset.value() == 1.5
     controller.metadata_changed.emit(controller.metadata)
     assert page.temp_offset.value() == 1.5
@@ -121,6 +127,46 @@ def test_unsaved_device_change_and_batch_calibration_confirm_affected_points(qt_
     repo.respond("calibrations", call[1][1])
     assert page.temp_offset.isEnabled() and page.temp_offset.value() == 1.5
     page.deleteLater()
+
+
+def test_settings_tabs_keep_position_and_synchronize_the_shell(qt_application, tmp_path):
+    window = MainWindow(tmp_path, demo=False)
+    window.show()
+    try:
+        routes = {label: (button, group) for button, page, label, group in window.nav_routes if page == 3}
+        alarm_button, _ = routes["报警记录"]
+        alarm_button.click()
+        qt_application.processEvents()
+        page = window.settings
+        bar = page._tabs.tabBar()
+        start_y = bar.mapTo(page, QPoint()).y()
+        assert page.current_tab() == 2 and window.title.text() == "报警记录"
+        assert page.alarm_device_combo.isVisible() and not page.device_combo.isVisible()
+
+        for index, title, visible_selector in (
+            (0, "测温分机采集规则", None),
+            (1, "温湿度微调", page.device_combo),
+            (2, "报警记录", page.alarm_device_combo),
+        ):
+            QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=bar.tabRect(index).center())
+            qt_application.processEvents()
+            assert bar.mapTo(page, QPoint()).y() == start_y
+            assert page.current_tab() == index and window.title.text() == title
+            assert [button for button, _, _, _ in window.nav_routes if button.isChecked()] == [routes[title][0]]
+            assert window.group_buttons[routes[title][1]].isChecked()
+            assert page.device_combo.isVisible() == (visible_selector is page.device_combo)
+            assert page.alarm_device_combo.isVisible() == (visible_selector is page.alarm_device_combo)
+
+        collection_button, _ = routes["测温分机采集规则"]
+        collection_button.click()
+        assert page.current_tab() == 0 and window.title.text() == "测温分机采集规则"
+    finally:
+        window.close()
+        for _ in range(200):
+            if not window.repo.thread.isRunning():
+                break
+            QTest.qWait(5)
+        assert not window.repo.thread.isRunning()
 
 
 def test_global_intervals_apply_only_after_successful_write(qt_application):

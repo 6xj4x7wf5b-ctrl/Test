@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QToolTip, QVBoxLayout, QWidget,
 )
 
+from .i18n import tr
 from .silo_model import SiloLayer, SiloPoint, SiloSnapshot
 
 _STATUS = {"ok": "正常", "offline": "离线", "stale": "数据过期", "not_ready": "尚未采样",
@@ -25,6 +26,10 @@ def _valid(point: SiloPoint | None) -> bool:
 
 def _temperature(point: SiloPoint | None) -> str:
     return f"{point.temperature:.1f}" if _valid(point) else "—"
+
+
+def _point_status(point: SiloPoint) -> str:
+    return tr("温度越限" if _valid(point) and point.alarm else _STATUS.get(point.status, "无有效数据"))
 
 
 def _ring_counts(total: int) -> tuple[int, int, int]:
@@ -111,9 +116,11 @@ class _SiloCanvas(QWidget):
         font = QFont(self.font())
         font.setPixelSize(11)
         painter.setFont(font)
+        metrics = QFontMetrics(font)
+        caption = tr("圆柱分层测温示意 · 环形位置不代表实际线距和埋深")
         painter.setPen(QColor("#66778a"))
         painter.drawText(QRectF(12, 5, self.width() - 24, 18), Qt.AlignmentFlag.AlignLeft,
-                         "圆柱分层测温示意 · 环形位置不代表实际线距和埋深")
+                         metrics.elidedText(caption, Qt.TextElideMode.ElideRight, self.width() - 24))
         cx, rx, top, bottom, cap, cy = self._geometry()
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor("#f7f9fb"))
@@ -131,7 +138,7 @@ class _SiloCanvas(QWidget):
         self.hit_regions = []
         if not self.layer or not self.layer.slots:
             painter.setPen(QColor("#66778a"))
-            painter.drawText(QRectF(cx - rx, cy - 12, rx * 2, 24), Qt.AlignmentFlag.AlignCenter, "暂无粮温测点")
+            painter.drawText(QRectF(cx - rx, cy - 12, rx * 2, 24), Qt.AlignmentFlag.AlignCenter, tr("暂无粮温测点"))
             return
         outer_x = rx - 34
         outer_y = min(78, max(58, self.height() * .28))
@@ -145,19 +152,18 @@ class _SiloCanvas(QWidget):
                                       outer_x * scale * 2, outer_y * scale * 2))
         by_slot = {point.slot: point for point in self.layer.points}
         positions = self._slot_rectangles(cx, rx, cy)
-        metrics = QFontMetrics(font)
         for slot, rect, anchor in positions:
             point = by_slot.get(slot)
             valid = _valid(point)
             alarm = valid and point.alarm
             if point is None:
                 background, border, foreground = "#ffffff", "#aebbc8", "#8693a0"
-                label = slot if self.display_mode == "cable" else "空位"
+                label = slot if self.display_mode == "cable" else tr("空位")
             else:
                 background, border, foreground = (("#fdecec", "#bd5353", "#a03e3e") if alarm else
                     ("#edf7ef", "#58946c", "#2d6845") if valid else ("#f0f2f4", "#a9b4bf", "#75818e"))
                 label = (_temperature(point) if self.display_mode == "temperature" else
-                         f"#{point.point:03}" if self.display_mode == "point" else point.cable or "未登记")
+                         f"#{point.point:03}" if self.display_mode == "point" else point.cable or tr("未登记"))
             if abs(rect.center().y() - anchor.y()) > 2:
                 painter.setPen(QPen(QColor("#b4c2cf"), 1))
                 painter.drawLine(anchor, rect.center())
@@ -173,9 +179,9 @@ class _SiloCanvas(QWidget):
                              metrics.elidedText(str(label), Qt.TextElideMode.ElideRight, int(rect.width()) - 6))
             self.hit_regions.append((rect, point, slot))
         painter.setPen(QColor("#65778a"))
-        label = self.layer.label if self.layer.registered else "未布点 · 中央分组示意"
-        painter.drawText(QRectF(self.width() - 162, self.height() - 20, 150, 15),
-                         Qt.AlignmentFlag.AlignRight, label)
+        label = self.layer.label if self.layer.registered else tr("未布点 · 中央分组示意")
+        painter.drawText(QRectF(12, self.height() - 20, self.width() - 24, 15), Qt.AlignmentFlag.AlignRight,
+                         metrics.elidedText(label, Qt.TextElideMode.ElideRight, self.width() - 24))
 
     def _hit(self, position):
         return next((item for item in reversed(self.hit_regions) if item[0].contains(position)), None)
@@ -189,13 +195,15 @@ class _SiloCanvas(QWidget):
         _, point, slot = item
         self.setCursor(Qt.CursorShape.PointingHandCursor if point is not None else Qt.CursorShape.ArrowCursor)
         if point is None:
-            text = f"线位：{html.escape(slot)}<br>本层没有对应测点，空心标记仅保留线位。"
+            text = tr("线位：{slot}<br>本层没有对应测点，空心标记仅保留线位。", slot=html.escape(slot))
         else:
             temperature = _temperature(point) + (" ℃" if _valid(point) else "")
-            state = "温度越限" if _valid(point) and point.alarm else _STATUS.get(point.status, "无有效数据")
-            text = (f"<b>粮温测点 #{point.point:03}</b><br>温度：{temperature}<br>状态：{state}<br>"
-                    f"测温线：{html.escape(point.cable or '未登记')}　层：{html.escape(point.layer or '未登记')}<br>"
-                    f"位置：{html.escape(point.position or '未登记')}")
+            unassigned = tr("未登记")
+            text = tr("<b>粮温测点 #{point:03}</b><br>温度：{temperature}<br>状态：{status}<br>"
+                      "测温线：{cable}　层：{layer}<br>位置：{position}",
+                      point=point.point, temperature=temperature, status=_point_status(point),
+                      cable=html.escape(point.cable or unassigned), layer=html.escape(point.layer or unassigned),
+                      position=html.escape(point.position or unassigned))
         QToolTip.showText(event.globalPosition().toPoint(), text, self)
 
     def leaveEvent(self, event):
@@ -219,7 +227,7 @@ class SiloView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.snapshot = SiloSnapshot(None, (), "请先选择仓房与分机。", "", 0)
+        self.snapshot = SiloSnapshot(None, (), tr("请先选择仓房与分机。"), "", 0)
         self.selected_point: int | None = None
         self._expanded_view = None
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -228,21 +236,22 @@ class SiloView(QWidget):
         layout.setSpacing(3)
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
-        toolbar.addWidget(QLabel("层 / 分组"))
+        toolbar.addWidget(QLabel(tr("层 / 分组")))
         self.layer_combo = QComboBox()
+        self.layer_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.layer_combo.setMinimumWidth(155)
         self.layer_combo.setMaximumWidth(270)
         self.layer_combo.currentIndexChanged.connect(self._layer_changed)
         toolbar.addWidget(self.layer_combo, 1)
         self.display_combo = QComboBox()
         for label, mode in (("温度（℃）", "temperature"), ("测点编号", "point"), ("测温线号", "cable")):
-            self.display_combo.addItem(label, mode)
+            self.display_combo.addItem(tr(label), mode)
         self.display_combo.currentIndexChanged.connect(self._display_changed)
         toolbar.addWidget(self.display_combo)
-        self.edit_button = QPushButton("调整布点")
+        self.edit_button = QPushButton(tr("调整布点"))
         self.edit_button.clicked.connect(self.edit_requested.emit)
         toolbar.addWidget(self.edit_button)
-        self.expand_button = QPushButton("放大")
+        self.expand_button = QPushButton(tr("放大"))
         self.expand_button.clicked.connect(self._expand)
         toolbar.addWidget(self.expand_button)
         layout.addLayout(toolbar)
@@ -251,12 +260,12 @@ class SiloView(QWidget):
         layout.addWidget(self.canvas, 1)
         footer = QHBoxLayout()
         footer.setSpacing(10)
-        legend = QLabel('<span style="color:#58946c">●</span> 正常　'
-                        '<span style="color:#bd5353">●</span> 越限　'
-                        '<span style="color:#9ca9b5">●</span> 无有效值')
+        legend = QLabel("　".join(f'<span style="color:{color}">●</span> {tr(label)}' for color, label in (
+            ("#58946c", "正常"), ("#bd5353", "越限"), ("#9ca9b5", "无有效值"),
+        )))
         legend.setStyleSheet("color:#66778a;font-size:10px;")
         footer.addWidget(legend)
-        self.selection_label = QLabel("点击测点查看编号与状态")
+        self.selection_label = QLabel(tr("点击测点查看编号与状态"))
         self.selection_label.setMinimumWidth(0)
         self.selection_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.selection_label.setStyleSheet("color:#2d527b;font-size:11px;")
@@ -264,7 +273,7 @@ class SiloView(QWidget):
         layout.addLayout(footer)
         self.message_label = QLabel(self.snapshot.message)
         self.message_label.setWordWrap(True)
-        self.message_label.setMaximumHeight(30)
+        self.message_label.setMaximumHeight(42)
         self.message_label.setStyleSheet("color:#66778a;font-size:11px;")
         layout.addWidget(self.message_label)
 
@@ -290,7 +299,7 @@ class SiloView(QWidget):
         self.edit_button.setEnabled(snapshot.device_id is not None and snapshot.grain_count > 0)
         self.canvas.snapshot = snapshot
         self.canvas.selected_point = self.selected_point
-        source = "模拟数据" if snapshot.source == "simulator" else "设备数据" if snapshot.source else ""
+        source = tr("模拟数据" if snapshot.source == "simulator" else "设备数据") if snapshot.source else ""
         self.message_label.setText(f"{source} · {snapshot.message}" if source else snapshot.message)
         self.message_label.setToolTip(snapshot.message)
         self._layer_changed()
@@ -318,17 +327,22 @@ class SiloView(QWidget):
         point = next((point for layer in self.snapshot.layers for point in layer.points
                       if point.point == self.selected_point), None)
         if point is None:
-            self.selection_label.setText("点击测点查看编号与状态")
+            self.selection_label.setText(tr("点击测点查看编号与状态"))
             self.selection_label.setToolTip("")
             return
-        status = "温度越限" if _valid(point) and point.alarm else _STATUS.get(point.status, "无有效数据")
-        text = f"测点 #{point.point:03} · {_temperature(point)}{' ℃' if _valid(point) else ''} · {status}"
+        temperature = _temperature(point) + (" ℃" if _valid(point) else "")
+        text = tr("测点 #{point:03} · {temperature} · {status}",
+                  point=point.point, temperature=temperature, status=_point_status(point))
         self.selection_label.setText(text)
-        self.selection_label.setToolTip(f"{text}\n测温线：{point.cable or '未登记'}　层：{point.layer or '未登记'}\n位置：{point.position or '未登记'}")
+        unassigned = tr("未登记")
+        self.selection_label.setToolTip(tr("{reading}<br>测温线：{cable}　层：{layer}<br>位置：{position}",
+                                           reading=html.escape(text), cable=html.escape(point.cable or unassigned),
+                                           layer=html.escape(point.layer or unassigned),
+                                           position=html.escape(point.position or unassigned)))
 
     def _expand(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("粮仓分层测温示意 · 放大")
+        dialog.setWindowTitle(tr("粮仓分层测温示意 · 放大"))
         dialog.resize(1060, 560)
         layout = QVBoxLayout(dialog)
         view = SiloView(dialog)
@@ -343,7 +357,7 @@ class SiloView(QWidget):
         view.point_selected.connect(self._point_chosen)
         view.edit_requested.connect(self.edit_requested.emit)
         layout.addWidget(view)
-        close_button = QPushButton("关闭放大视图")
+        close_button = QPushButton(tr("关闭放大视图"))
         close_button.clicked.connect(dialog.accept)
         layout.addWidget(close_button)
         self._expanded_view = view

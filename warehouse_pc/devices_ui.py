@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QSpinBox, QStackedWidget, QGroupBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
+    QPushButton, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .registration import RegistrationDialog
 from .domain import source_for_port
+from .filter_panel import FilterPanel
+from .i18n import tr
+from .registration import RegistrationDialog
 
 
 def button(text, callback, primary=False):
@@ -18,6 +20,27 @@ def button(text, callback, primary=False):
     if primary:
         widget.setObjectName("primary")
     widget.clicked.connect(callback)
+    return widget
+
+
+def _toolbar():
+    widget = QWidget()
+    widget.setObjectName("toolbar")
+    row = QHBoxLayout(widget)
+    row.setContentsMargins(0, 0, 0, 0)
+    return widget, row
+
+
+def _more_button(actions):
+    widget = QPushButton(tr("更多"))
+    widget.setObjectName("secondary")
+    menu = QMenu(widget)
+    for title, callback in actions:
+        if title:
+            menu.addAction(title, callback)
+        else:
+            menu.addSeparator()
+    widget.setMenu(menu)
     return widget
 
 
@@ -48,7 +71,7 @@ class PortDialog(QDialog):
     def __init__(self, manager, current=None, parent=None, demo=False):
         super().__init__(parent)
         current = current or {}
-        self.setWindowTitle("串口连接设置")
+        self.setWindowTitle(tr("串口连接设置"))
         self.setMinimumWidth(430)
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -64,7 +87,7 @@ class PortDialog(QDialog):
         self.baud.addItems([str(n) for n in (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200)])
         self.baud.setCurrentText(str(current.get("baud", 1200)))
         self.parity = QComboBox()
-        for text, value in (("无校验 N", "N"), ("偶校验 E", "E"), ("奇校验 O", "O")):
+        for text, value in ((tr("无校验 N"), "N"), (tr("偶校验 E"), "E"), (tr("奇校验 O"), "O")):
             self.parity.addItem(text, value)
         self.parity.setCurrentIndex(self.parity.findData(current.get("parity", "N")))
         self.stop = QComboBox()
@@ -78,19 +101,18 @@ class PortDialog(QDialog):
             self.port.addItems(["SIMULATOR"] if demo else [p["port_name"] for p in manager.available_ports()])
             if selected:
                 self.port.setCurrentText(selected)
-        port_row.addWidget(button("刷新", refresh_ports))
-        form.addRow("串口", port_row)
-        for label, widget in (("连接名称", self.name), ("波特率", self.baud),
-                              ("校验位", self.parity), ("停止位", self.stop)):
+        port_row.addWidget(button(tr("刷新"), refresh_ports))
+        form.addRow(tr("串口"), port_row)
+        for label, widget in ((tr("连接名称"), self.name), (tr("波特率"), self.baud),
+                              (tr("校验位"), self.parity), (tr("停止位"), self.stop)):
             form.addRow(label, widget)
         layout.addLayout(form)
-        hint = QLabel("多个模拟通道可填写 simulator://2 等名称。" if demo else "选择系统识别的串口；模拟设备请通过单独的演示入口使用。")
-        hint.setWordWrap(True)
-        hint.setObjectName("muted")
-        layout.addWidget(hint)
+        self.port.setToolTip(tr("多个模拟通道可填写 simulator://2 等名称。") if demo else tr("选择系统识别的串口。"))
+        self.baud.setToolTip(tr("当前 LC-M3 固件使用 1200 / 8N1。"))
         actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        actions.button(QDialogButtonBox.StandardButton.Save).setText("保存")
-        actions.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        actions.button(QDialogButtonBox.StandardButton.Save).setText(tr("保存"))
+        actions.button(QDialogButtonBox.StandardButton.Save).setObjectName("primary")
+        actions.button(QDialogButtonBox.StandardButton.Cancel).setText(tr("取消"))
         actions.accepted.connect(self.accept)
         actions.rejected.connect(self.reject)
         layout.addWidget(actions)
@@ -104,7 +126,7 @@ class DeviceDialog(QDialog):
     def __init__(self, metadata, current=None, parent=None):
         super().__init__(parent)
         current = current or {}
-        self.setWindowTitle("分机设置")
+        self.setWindowTitle(tr("分机设置"))
         self.setMinimumWidth(430)
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -126,27 +148,26 @@ class DeviceDialog(QDialog):
         for combo, key in ((self.warehouse, "warehouse_id"), (self.port, "port_id")):
             if key in current:
                 combo.setCurrentIndex(combo.findData(current[key]))
-        for label, widget in (("分机名称", self.name), ("所属仓房", self.warehouse), ("串口", self.port),
-                              ("板上地址", self.address)):
+        for label, widget in ((tr("分机名称"), self.name), (tr("所属仓房"), self.warehouse), (tr("串口"), self.port),
+                              (tr("板上地址"), self.address)):
             form.addRow(label, widget)
         layout.addLayout(form)
-        advanced_toggle = QPushButton("高级：采集协议与旧机查询范围")
+        advanced_toggle = QPushButton(tr("高级选项"))
+        advanced_toggle.setObjectName("quietButton")
         advanced_toggle.setCheckable(True)
+        advanced_toggle.setToolTip(tr("采集协议及旧机查询范围。已登记的分机按实际测点采集。"))
         advanced = QWidget()
         advanced_form = QFormLayout(advanced)
-        for label, widget in (("采集协议", self.protocol), ("旧机粮温最大点号", self.grain), ("旧机仓温湿最大点号", self.ambient)):
+        for label, widget in ((tr("采集协议"), self.protocol), (tr("旧机粮温最大点号"), self.grain), (tr("旧机仓温湿最大点号"), self.ambient)):
             advanced_form.addRow(label, widget)
         advanced_toggle.toggled.connect(advanced.setVisible)
         advanced.hide()
         layout.addWidget(advanced_toggle)
         layout.addWidget(advanced)
-        hint = QLabel("新分机添加后请登记探头。完成登记核对后按实际测点采集；旧机查询范围仅用于尚未同步登记表的设备。")
-        hint.setWordWrap(True)
-        hint.setObjectName("muted")
-        layout.addWidget(hint)
         actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        actions.button(QDialogButtonBox.StandardButton.Save).setText("保存")
-        actions.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        actions.button(QDialogButtonBox.StandardButton.Save).setText(tr("保存"))
+        actions.button(QDialogButtonBox.StandardButton.Save).setObjectName("primary")
+        actions.button(QDialogButtonBox.StandardButton.Cancel).setText(tr("取消"))
         actions.accepted.connect(self.accept)
         actions.rejected.connect(self.reject)
         layout.addWidget(actions)
@@ -179,52 +200,77 @@ class DevicesPage(QWidget):
         for page in (device_page, port_page, registration_page):
             self.pages.addWidget(page)
         devices = QVBoxLayout(device_page)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("测温分机")); row.addStretch()
-        row.addWidget(button("新增分机", self.add_device, True))
-        row.addWidget(button("编辑分机", self.edit_device))
-        row.addWidget(button("查询在线状态", self.ping))
-        row.addWidget(button("登记探头", self.register, True))
-        row.addWidget(button("删除分机", self.delete_device))
-        devices.addLayout(row)
-        self.devices_table = table(["分机 / 仓房", "实际串口", "板上地址", "采集协议", "登记 / 查询范围", "通信状态"])
+        toolbar, row = _toolbar()
+        row.addWidget(button(tr("新增分机"), self.add_device, True))
+        row.addStretch()
+        self.register_selected_button = button(tr("登记探头"), self.register)
+        self.register_selected_button.setObjectName("secondary")
+        row.addWidget(self.register_selected_button)
+        self.device_more = _more_button(((tr("编辑分机"), self.edit_device), (tr("查询在线状态"), self.ping),
+                                         (None, None), (tr("删除分机…"), self.delete_device)))
+        row.addWidget(self.device_more)
+        devices.addWidget(toolbar)
+        self.devices_table = table([tr("分机 / 仓房"), tr("实际串口"), tr("板上地址"),
+                                    tr("采集协议"), tr("登记 / 查询范围"), tr("通信状态")])
         devices.addWidget(self.devices_table, 1)
-        hint = QLabel("新增分机 → 打开对应串口 → 登记探头 → 开始采集。串口打开不代表分机已响应。")
-        hint.setWordWrap(True); hint.setObjectName("muted"); devices.addWidget(hint)
         ports = QVBoxLayout(port_page)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("串口设置")); row.addStretch()
-        row.addWidget(button("新增串口", self.add_port, True))
-        row.addWidget(button("编辑参数", self.edit_port))
-        row.addWidget(button("打开 / 关闭串口", self.toggle_port))
-        row.addWidget(button("删除串口", self.delete_port))
-        ports.addLayout(row)
-        self.ports_table = table(["连接名称", "实际端口", "串口参数", "关联分机", "端口状态"])
+        toolbar, row = _toolbar()
+        row.addWidget(button(tr("新增串口"), self.add_port, True))
+        row.addStretch()
+        self.toggle_selected_port_button = button(tr("打开串口"), self.toggle_port)
+        self.toggle_selected_port_button.setObjectName("secondary")
+        row.addWidget(self.toggle_selected_port_button)
+        self.port_more = _more_button(((tr("编辑参数"), self.edit_port), (None, None), (tr("删除串口…"), self.delete_port)))
+        row.addWidget(self.port_more)
+        ports.addWidget(toolbar)
+        self.ports_table = table([tr("连接名称"), tr("实际端口"), tr("串口参数"), tr("关联分机"), tr("端口状态")])
         ports.addWidget(self.ports_table, 1)
-        hint = QLabel("当前板默认 1200 / 8N1。同一串口可关联多台不同地址的分机；修改参数前先关闭串口。")
-        hint.setWordWrap(True); hint.setObjectName("muted"); ports.addWidget(hint)
         self.registration_layout = QVBoxLayout(registration_page)
-        select_row = QHBoxLayout()
-        select_row.addWidget(QLabel("登记目标"))
+        self.registration_layout.setContentsMargins(0, 0, 0, 0)
+        self.registration_selector = FilterPanel()
         self.registration_device = QComboBox()
-        select_row.addWidget(self.registration_device, 1)
-        self.open_registration_button = button("连接并读取", self.register, True)
-        select_row.addWidget(self.open_registration_button)
-        self.registration_layout.addLayout(select_row)
-        self.registration_hint = QLabel("选择分机后读取登记表。单支路自动使用默认支路，无需填写。")
+        self.registration_device.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.registration_device.setMinimumContentsLength(12)
+        self.registration_selector.add_field(tr("分机"), self.registration_device)
+        self.open_registration_button = button(tr("连接并读取"), self.register, True)
+        self.registration_selector.add_action(self.open_registration_button)
+        self.registration_layout.addWidget(self.registration_selector)
+        self.registration_hint = QLabel()
         self.registration_hint.setWordWrap(True)
         self.registration_layout.addWidget(self.registration_hint)
+        self.registration_hint.hide()
         self.registration_layout.addStretch(1)
+        self.devices_table.itemSelectionChanged.connect(self._update_row_actions)
+        self.ports_table.itemSelectionChanged.connect(self._update_row_actions)
         controller.metadata_changed.connect(self.refresh)
         controller.connections_changed.connect(self.refresh_status)
+        self._update_row_actions()
+        self.open_registration_button.setEnabled(False)
+
+    def _update_row_actions(self):
+        has_device = self._selected_id(self.devices_table) is not None
+        self.register_selected_button.setEnabled(has_device)
+        self.device_more.setEnabled(has_device)
+        port_id = self._selected_id(self.ports_table)
+        self.toggle_selected_port_button.setEnabled(port_id is not None)
+        self.port_more.setEnabled(port_id is not None)
+        connected = port_id is not None and self.controller.manager.is_connected(str(port_id))
+        self.toggle_selected_port_button.setText(tr("关闭串口") if connected else tr("打开串口"))
+
+    def _registration_feedback(self, text=""):
+        self.registration_hint.setText(text)
+        self.registration_hint.setVisible(bool(text))
 
     @staticmethod
     def _selected_id(widget):
+        if not widget.selectedItems():
+            return None
         item = widget.item(widget.currentRow(), 0)
         return item.data(Qt.ItemDataRole.UserRole) if item else None
 
     @staticmethod
     def _restore_selection(widget, rows, selected):
+        widget.clearSelection()
         for index, row in enumerate(rows):
             widget.item(index, 0).setData(Qt.ItemDataRole.UserRole, row["id"])
             if row["id"] == selected:
@@ -238,30 +284,42 @@ class DevicesPage(QWidget):
         self.registration_device.blockSignals(True)
         self.registration_device.clear()
         for d in metadata["devices"]:
-            self.registration_device.addItem(f"{d['name']} · {d['warehouse_name']} · {d['port_name']} · 地址 {d['address']}", d["id"])
+            label = tr("{name} · {warehouse} · {port} · 地址 {address}", name=d["name"],
+                       warehouse=d["warehouse_name"], port=d["port_name"], address=d["address"])
+            self.registration_device.addItem(label, d["id"])
         self.registration_device.setCurrentIndex(max(0, self.registration_device.findData(selected_registration)))
         self.registration_device.blockSignals(False)
+        self.open_registration_button.setEnabled(bool(metadata["devices"]) and not self._registration_active)
+        if not self._registration_active:
+            if not metadata["devices"]:
+                self._registration_feedback(tr("请先新增分机。"))
+            elif self.registration_hint.text() == tr("请先新增分机。"):
+                self._registration_feedback()
         self.refresh_status()
 
     def _fill_devices(self, selected):
         rows = []
         for d in self._metadata["devices"]:
             points = d.get("registered_points")
-            scope = (f"已登记 {len(points)} 点" if points is not None else "待登记" if d.get("registration_required")
-                     else f"旧机范围 {d['grain_count']} / {d['ambient_count']}")
+            scope = (tr("已登记 {count} 点", count=len(points)) if points is not None
+                     else tr("待登记") if d.get("registration_required")
+                     else tr("旧机范围 {grain} / {ambient}", grain=d["grain_count"], ambient=d["ambient_count"]))
             rows.append([f"{d['name']} / {d['warehouse_name']}", d["port_name"], d["address"], d["protocol"], scope,
-                         self.controller.communication_state(d)])
-        fill_table(self.devices_table, rows)
-        self._restore_selection(self.devices_table, self._metadata["devices"], selected)
+                         tr(self.controller.communication_state(d))])
+        with QSignalBlocker(self.devices_table):
+            fill_table(self.devices_table, rows)
+            self._restore_selection(self.devices_table, self._metadata["devices"], selected)
 
     def refresh_status(self):
         selected = self._selected_id(self.ports_table)
-        fill_table(self.ports_table, [[p["name"], p["port_name"], f"{p['baud']} / 8{p['parity']}{p['stop_bits']}",
-                                     "、".join(d["name"] for d in self._metadata["devices"] if d["port_id"] == p["id"]) or "未关联",
-                                     "已打开" if self.controller.manager.is_connected(str(p["id"])) else "已关闭"]
-                                    for p in self._metadata["ports"]])
-        self._restore_selection(self.ports_table, self._metadata["ports"], selected)
+        with QSignalBlocker(self.ports_table):
+            fill_table(self.ports_table, [[p["name"], p["port_name"], f"{p['baud']} / 8{p['parity']}{p['stop_bits']}",
+                                         "、".join(d["name"] for d in self._metadata["devices"] if d["port_id"] == p["id"]) or tr("未关联"),
+                                         tr("已打开") if self.controller.manager.is_connected(str(p["id"])) else tr("已关闭")]
+                                        for p in self._metadata["ports"]])
+            self._restore_selection(self.ports_table, self._metadata["ports"], selected)
         self._fill_devices(self._selected_id(self.devices_table))
+        self._update_row_actions()
 
     def can_leave(self):
         if self.registration_dialog is not None:
@@ -285,8 +343,8 @@ class DevicesPage(QWidget):
         widget = self.ports_table if category == "ports" else self.devices_table
         index = widget.currentRow()
         rows = self._metadata[category]
-        if not 0 <= index < len(rows):
-            QMessageBox.information(self, "请选择", "请先选择一行记录。")
+        if not widget.selectedItems() or not 0 <= index < len(rows):
+            QMessageBox.information(self, tr("请选择"), tr("请先选择一行记录。"))
             return None
         return rows[index]
 
@@ -296,14 +354,14 @@ class DevicesPage(QWidget):
         if method == "save_port":
             expected = "simulator" if self.controller.demo else "serial"
             if source_for_port(kwargs["port_name"]) != expected:
-                QMessageBox.information(self, "数据模式不同", "模拟与实机连接使用独立入口，不能加入当前数据库。")
+                QMessageBox.information(self, tr("数据模式不同"), tr("模拟与实机连接使用独立入口，不能加入当前数据库。"))
                 return
         self._saving = self.controller.config_saving = True
         self.setEnabled(False)
         def failed(message):
             self._saving = self.controller.config_saving = False
             self.setEnabled(True)
-            self.repo.error.emit(message)
+            self.repo.error.emit(tr("设备配置保存失败：{error}", error=message))
         def done(value):
             def loaded(_):
                 self._saving = self.controller.config_saving = False
@@ -314,7 +372,7 @@ class DevicesPage(QWidget):
         self.repo.call(method, callback=done, on_error=failed, **kwargs)
 
     def add_warehouse(self):
-        name, ok = QInputDialog.getText(self, "新增仓房", "仓房名称")
+        name, ok = QInputDialog.getText(self, tr("新增仓房"), tr("仓房名称"))
         if ok and name.strip():
             self.save("save_warehouse", name=name)
 
@@ -328,7 +386,7 @@ class DevicesPage(QWidget):
         if not current:
             return
         if self.controller.manager.is_connected(str(current["id"])):
-            QMessageBox.information(self, "连接仍打开", "请先断开此连接，再修改串口设置。")
+            QMessageBox.information(self, tr("连接仍打开"), tr("请先断开此连接，再修改串口设置。"))
             return
         dialog = PortDialog(self.controller.manager, current, self, demo=self.controller.demo)
         if dialog.exec():
@@ -347,15 +405,17 @@ class DevicesPage(QWidget):
     def delete_port(self):
         port = self.selected("ports")
         if port and any(d["port_id"] == port["id"] for d in self._metadata["devices"]):
-            QMessageBox.information(self, "串口有关联分机", "请先修改或移除关联分机；本次不会断开串口。")
+            QMessageBox.information(self, tr("串口有关联分机"), tr("请先修改或移除关联分机；本次不会断开串口。"))
             return
-        if port and QMessageBox.question(self, "删除连接", f"删除连接“{port['name']}”？需先处理其关联分机。") == QMessageBox.StandardButton.Yes:
+        if port and QMessageBox.question(
+                self, tr("删除连接"),
+                tr("删除连接“{name}”？需先处理其关联分机。", name=port["name"])) == QMessageBox.StandardButton.Yes:
             self.controller.manager.disconnect_port(str(port["id"]))
             self.save("delete_port", id=port["id"])
 
     def add_device(self):
         if not self._metadata["warehouses"]:
-            name, ok = QInputDialog.getText(self, "新增分机 · 创建仓房", "先填写所属仓房名称")
+            name, ok = QInputDialog.getText(self, tr("新增分机 · 创建仓房"), tr("先填写所属仓房名称"))
             if ok and name.strip():
                 self.save("save_warehouse", name=name.strip(), callback=lambda _: self.add_device())
             return
@@ -373,7 +433,7 @@ class DevicesPage(QWidget):
         if not device:
             return
         if self.controller.manager.is_connected(str(device["port_id"])):
-            QMessageBox.information(self, "连接仍打开", "请先断开对应串口，再修改分机配置。")
+            QMessageBox.information(self, tr("连接仍打开"), tr("请先断开对应串口，再修改分机配置。"))
             return
         dialog = DeviceDialog(self._metadata, device, self)
         if dialog.exec():
@@ -382,10 +442,13 @@ class DevicesPage(QWidget):
     def delete_device(self):
         device = self.selected("devices")
         if device and not self.controller.manager.is_connected(str(device["port_id"])):
-            if QMessageBox.question(self, "删除分机", f"删除“{device['name']}”？已有历史或报警的分机会保留，不执行删除。") == QMessageBox.StandardButton.Yes:
+            if QMessageBox.question(
+                    self, tr("删除分机"),
+                    tr("删除“{name}”？已有历史或报警的分机会保留，不执行删除。",
+                       name=device["name"])) == QMessageBox.StandardButton.Yes:
                 self.save("delete_device", id=device["id"])
         elif device:
-            QMessageBox.information(self, "连接仍打开", "请先断开对应串口。")
+            QMessageBox.information(self, tr("连接仍打开"), tr("请先断开对应串口。"))
 
     def ping(self):
         device = self.selected("devices")
@@ -409,7 +472,7 @@ class DevicesPage(QWidget):
         self._registration_active = True
         self.registration_device.setEnabled(False)
         self.open_registration_button.setEnabled(False)
-        self.registration_hint.setText("正在连接并等候当前串口请求完成…")
+        self._registration_feedback(tr("正在连接并读取…"))
         if not self.controller.manager.is_connected(profile):
             port = next(p for p in self._metadata["ports"] if p["id"] == device["port_id"])
             self.controller.connect_port(port)
@@ -421,12 +484,12 @@ class DevicesPage(QWidget):
         def ready():
             if not self.controller.manager.is_connected(profile):
                 self.can_leave()
-                self.registration_hint.setText("串口连接失败，请到串口设置检查端口。")
+                self._registration_feedback(tr("串口连接失败，请检查串口设置。"))
                 return
             if self.controller.manager.busy(profile):
                 if time.monotonic() - started > 60:
                     self.can_leave()
-                    self.registration_hint.setText("串口仍忙，请完成当前任务后重试。")
+                    self._registration_feedback(tr("串口仍忙，请完成当前任务后重试。"))
                 return
             timer.stop(); timer.deleteLater(); self._registration_wait = None
             dialog = RegistrationDialog(self.controller.manager, profile, device["address"], device["name"], self,
@@ -437,7 +500,8 @@ class DevicesPage(QWidget):
             dialog.finished.connect(self._finish_registration)
             self.registration_layout.setStretch(self.registration_layout.count() - 1, 0)
             self.registration_layout.insertWidget(2, dialog, 1)
-            self.registration_hint.hide()
+            self._registration_feedback()
+            self.registration_selector.hide()
             dialog.show()
         timer.timeout.connect(ready)
         timer.start()
@@ -451,9 +515,9 @@ class DevicesPage(QWidget):
         self._registration_active = False
         self.registration_layout.setStretch(self.registration_layout.count() - 1, 1)
         self.registration_device.setEnabled(True)
-        self.open_registration_button.setEnabled(True)
-        self.registration_hint.setText("登记操作已结束，可开始采集或选择另一台分机。")
-        self.registration_hint.show()
+        self.open_registration_button.setEnabled(bool(self._metadata["devices"]))
+        self.registration_selector.show()
+        self._registration_feedback()
         profile = getattr(self, "_registration_profile", "")
         if not self._sync_pending.get(profile) and profile not in self._sync_failed:
             self.controller.resume_port(profile)
@@ -470,11 +534,14 @@ class DevicesPage(QWidget):
         def failed(message):
             self._sync_failed.add(profile)
             completed()
-            self.repo.error.emit(f"分机登记已读取，但电脑档案同步失败；本串口暂停采集，请重新读取登记表重试。{message}")
+            self.repo.error.emit(tr("分机登记已读取，但电脑档案同步失败；本串口暂停采集，请重新读取登记表重试。{error}",
+                                    error=message))
         def synced(_):
             def loaded(_):
                 self._sync_failed.discard(profile)
-                self.controller.log.emit(f"{device['name']}：已同步 {len(payload['bindings'])} 个登记点（配置代次 {payload['generation']}）")
+                self.controller.log.emit(tr("{name}：已同步 {count} 个登记点（配置代次 {generation}）",
+                                            name=device["name"], count=len(payload["bindings"]),
+                                            generation=payload["generation"]))
                 completed()
             self.controller.reload_metadata(callback=loaded, on_error=failed)
         self.repo.call("sync_verified_bindings", device["id"], payload["bindings"], payload["generation"], callback=synced, on_error=failed)

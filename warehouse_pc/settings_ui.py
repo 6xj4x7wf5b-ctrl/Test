@@ -5,14 +5,18 @@ import math
 
 from PySide6.QtCore import QSignalBlocker, Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
     QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+from .filter_panel import FilterPanel
+from .i18n import tr
 
 
 class SettingsPage(QWidget):
     sound_changed = Signal(bool)
+    tab_changed = Signal(int)
 
     def __init__(self, repository, controller, parent=None):
         super().__init__(parent)
@@ -40,66 +44,76 @@ class SettingsPage(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        title = QLabel("参数设置与报警")
-        title.setObjectName("pageTitle")
-        layout.addWidget(title)
-        device_row = QHBoxLayout()
-        device_label = QLabel("微调与阈值适用设备")
-        device_row.addWidget(device_label)
-        self.device_combo = QComboBox()
-        self.device_combo.setMinimumWidth(240)
-        self.device_combo.setMaximumWidth(420)
-        self.device_combo.currentIndexChanged.connect(self._device_changed)
-        device_row.addWidget(self.device_combo)
-        self.retry_device_button = QPushButton("重新读取参数")
-        self.retry_device_button.clicked.connect(self._reload_device_parameters)
-        device_row.addWidget(self.retry_device_button)
-        device_row.addStretch()
-        layout.addLayout(device_row)
+        layout.setContentsMargins(0, 0, 0, 0)
         tabs = QTabWidget()
         self._tabs = tabs
         layout.addWidget(tabs, 1)
-        self.message = QLabel("所有修正仅用于后续采集，历史记录保留采集时的原值与修正值。")
+        feedback = QHBoxLayout()
+        self.message = QLabel()
         self.message.setWordWrap(True)
-        layout.addWidget(self.message)
+        self.message.hide()
+        self.draft_label = QLabel(tr("有未保存的修改"))
+        self.draft_label.setObjectName("muted")
+        self.draft_label.hide()
+        feedback.addWidget(self.message, 1)
+        feedback.addWidget(self.draft_label, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(feedback)
 
         collection = QWidget()
+        collection.setObjectName("settingsPanel")
         collection_layout = QVBoxLayout(collection)
-        group = QGroupBox("采集与历史 · 适用于全部分机")
-        form = QFormLayout(group)
+        global_title = QLabel(tr("所有分机"))
+        global_title.setObjectName("sectionTitle")
+        collection_layout.addWidget(global_title)
+        form = QFormLayout()
         self.poll_seconds = QSpinBox()
         self.poll_seconds.setRange(1, 86_400)
-        self.poll_seconds.setSuffix(" 秒")
+        self.poll_seconds.setSuffix(tr(" 秒"))
         self.poll_seconds.setValue(5)
         self.history_seconds = QSpinBox()
         self.history_seconds.setRange(1, 31_536_000)
-        self.history_seconds.setSuffix(" 秒")
+        self.history_seconds.setSuffix(tr(" 秒"))
         self.history_seconds.setValue(30)
         self.poll_seconds.setMaximumWidth(150)
         self.history_seconds.setMaximumWidth(170)
-        form.addRow("实时采集周期", self.poll_seconds)
-        form.addRow("历史保存间隔", self.history_seconds)
-        self.intervals_button = intervals = QPushButton("应用采集与保存周期")
+        self.poll_seconds.setToolTip(tr("上位机请求数据的间隔。实际刷新速度取决于串口和分机。"))
+        self.history_seconds.setToolTip(tr("控制历史入库频率，不影响实时显示。采集记录仅可手动清理。"))
+        form.addRow(tr("采集周期"), self.poll_seconds)
+        form.addRow(tr("历史保存间隔"), self.history_seconds)
+        self.intervals_button = intervals = QPushButton(tr("保存设置"))
+        intervals.setObjectName("primary")
         intervals.setMaximumWidth(180)
         intervals.clicked.connect(self._save_intervals)
-        form.addRow(intervals)
-        collection_layout.addWidget(group)
-        note = QLabel("实时采集与历史保存分开执行。历史记录永久保留，只有手动清理才会删除；保存频率不会快于实际完成采样的频率。")
-        note.setWordWrap(True)
-        collection_layout.addWidget(note)
-        self.sound_box = QCheckBox("开启报警声音（仅当前、未确认的报警发声）")
+        save_row = QHBoxLayout()
+        save_row.addWidget(intervals)
+        self.global_loading = QLabel()
+        self.global_loading.setObjectName("muted")
+        save_row.addWidget(self.global_loading)
+        save_row.addStretch()
+        form.addRow(save_row)
+        collection_layout.addLayout(form)
+        self.sound_box = QCheckBox(tr("报警声音"))
+        self.sound_box.setToolTip(tr("当前且未确认的报警发声。关闭声音仍会保留报警记录。"))
         self.sound_box.setChecked(True)
         self.sound_box.toggled.connect(self._save_sound)
         collection_layout.addWidget(self.sound_box)
         collection_layout.addStretch()
-        tabs.addTab(collection, "采集与声音")
+        tabs.addTab(collection, tr("采集设置"))
 
         calibration = QWidget()
+        calibration.setObjectName("settingsScopePage")
         cal_layout = QVBoxLayout(calibration)
-        cal_form = QFormLayout()
+        calibration_bar, self.device_combo, self.retry_device_button, self.device_loading = self._device_toolbar()
+        cal_layout.addWidget(calibration_bar)
+        cal_content = QFrame()
+        cal_content.setObjectName("section")
+        cal_content_layout = QVBoxLayout(cal_content)
+        cal_content_layout.setContentsMargins(12, 10, 12, 12)
+        cal_layout.addWidget(cal_content)
+        self._cal_form = cal_form = QFormLayout()
         self.kind_combo = QComboBox()
-        self.kind_combo.addItem("粮温测点", "grain")
-        self.kind_combo.addItem("仓温仓湿", "ambient")
+        self.kind_combo.addItem(tr("粮温测点"), "grain")
+        self.kind_combo.addItem(tr("仓温仓湿"), "ambient")
         self.kind_combo.currentIndexChanged.connect(self._kind_changed)
         self.point_combo = QComboBox()
         self.point_combo.currentIndexChanged.connect(self._kind_changed)
@@ -113,75 +127,127 @@ class SettingsPage(QWidget):
         self.humidity_offset.setDecimals(2)
         self.humidity_offset.setSingleStep(0.1)
         self.humidity_offset.setSuffix(" %RH")
-        for widget in (self.kind_combo, self.point_combo, self.temp_offset, self.humidity_offset):
+        self.kind_combo.setMaximumWidth(300)
+        for widget in (self.point_combo, self.temp_offset, self.humidity_offset):
             widget.setMaximumWidth(190)
-        self.batch_box = QCheckBox("应用到当前设备的同类全部测点")
+        self.batch_box = QCheckBox(tr("批量应用到同类测点"))
         self.batch_box.toggled.connect(self._update_enabled)
-        cal_form.addRow("测点类型", self.kind_combo)
-        cal_form.addRow("测点编号", self.point_combo)
-        cal_form.addRow("温度加减修正", self.temp_offset)
-        cal_form.addRow("湿度加减修正", self.humidity_offset)
+        cal_form.addRow(tr("测点类型"), self.kind_combo)
+        cal_form.addRow(tr("测点编号"), self.point_combo)
+        cal_form.addRow(tr("温度偏移"), self.temp_offset)
+        cal_form.addRow(tr("湿度偏移"), self.humidity_offset)
+        for offset in (self.temp_offset, self.humidity_offset):
+            offset.setToolTip(tr("修正值等于原始值加偏移。仅影响以后采集，历史记录保持原值。"))
         cal_form.addRow(self.batch_box)
-        self.save_calibration_button = QPushButton("保存微调参数")
-        self.save_calibration_button.setMaximumWidth(150)
+        self.save_calibration_button = QPushButton(tr("保存微调"))
+        self.save_calibration_button.setObjectName("primary")
+        self.save_calibration_button.setMaximumWidth(240)
         self.save_calibration_button.clicked.connect(self._save_calibration)
         cal_form.addRow(self.save_calibration_button)
-        cal_layout.addLayout(cal_form)
-        self.calibration_version = QLabel("尚未选择设备")
-        cal_layout.addWidget(self.calibration_version)
-        explanation = QLabel("修正值 = 原始值 + 微调值。保存后仅对之后采集生效；历史数据不会重新计算。批量操作在一个事务中完成，粮温测点不进行湿度修正。")
-        explanation.setWordWrap(True)
-        cal_layout.addWidget(explanation)
+        cal_content_layout.addLayout(cal_form)
+        self.calibration_version = QLabel(tr("尚未选择设备"))
+        self.calibration_version.setObjectName("muted")
+        cal_content_layout.addWidget(self.calibration_version)
         cal_layout.addStretch()
-        tabs.addTab(calibration, "测点微调")
+        tabs.addTab(calibration, tr("温湿度微调"))
 
         alarms = QWidget()
+        alarms.setObjectName("settingsScopePage")
         alarms_layout = QVBoxLayout(alarms)
-        threshold_group = QGroupBox("当前设备报警阈值")
-        threshold_form = QFormLayout(threshold_group)
+        alarms_bar, self.alarm_device_combo, self.retry_alarm_device_button, self.alarm_device_loading = self._device_toolbar()
+        alarms_layout.addWidget(alarms_bar)
+        threshold_content = QFrame()
+        threshold_content.setObjectName("section")
+        threshold_content_layout = QVBoxLayout(threshold_content)
+        threshold_content_layout.setContentsMargins(12, 10, 12, 12)
+        alarms_layout.addWidget(threshold_content)
+        thresholds_heading = QLabel(tr("报警阈值"))
+        thresholds_heading.setObjectName("sectionTitle")
+        threshold_content_layout.addWidget(thresholds_heading)
+        self._threshold_form = threshold_form = QFormLayout()
         self.threshold_kind = QComboBox()
-        self.threshold_kind.addItem("粮温测点", "grain")
-        self.threshold_kind.addItem("仓温仓湿", "ambient")
+        self.threshold_kind.addItem(tr("粮温测点"), "grain")
+        self.threshold_kind.addItem(tr("仓温仓湿"), "ambient")
         self.threshold_kind.currentIndexChanged.connect(self._threshold_changed)
-        self.threshold_kind.setMaximumWidth(190)
-        threshold_form.addRow("适用类型", self.threshold_kind)
+        self.threshold_kind.setMaximumWidth(300)
+        threshold_form.addRow(tr("测点类型"), self.threshold_kind)
         self.threshold_inputs = {}
-        for field, label in (("temp_low", "温度下限（℃）"), ("temp_high", "温度上限（℃）"),
-                             ("humidity_low", "湿度下限（%RH）"), ("humidity_high", "湿度上限（%RH）")):
+        for field, label in (("temp_low", tr("温度下限（℃）")), ("temp_high", tr("温度上限（℃）")),
+                             ("humidity_low", tr("湿度下限（%RH）")), ("humidity_high", tr("湿度上限（%RH）"))):
             editor = QLineEdit()
-            editor.setPlaceholderText("留空表示不启用")
+            editor.setPlaceholderText(tr("不设限"))
             editor.setMaximumWidth(190)
             self.threshold_inputs[field] = editor
             threshold_form.addRow(label, editor)
-        self.save_threshold_button = QPushButton("保存阈值")
+        self.save_threshold_button = QPushButton(tr("保存阈值"))
+        self.save_threshold_button.setObjectName("primary")
         self.save_threshold_button.setMaximumWidth(150)
         self.save_threshold_button.clicked.connect(self._save_threshold)
         threshold_form.addRow(self.save_threshold_button)
-        alarms_layout.addWidget(threshold_group)
+        threshold_content_layout.addLayout(threshold_form)
         alarm_toolbar = QHBoxLayout()
-        ack = QPushButton("确认 / 消音所选报警")
+        alarm_heading = QLabel(tr("全部分机报警"))
+        alarm_heading.setObjectName("sectionTitle")
+        alarm_toolbar.addWidget(alarm_heading, 1)
+        ack = QPushButton(tr("确认所选"))
+        ack.setToolTip(tr("确认并消音所选的当前报警"))
         ack.clicked.connect(self._ack_selected)
-        ack_all = QPushButton("全部消音")
+        ack_all = QPushButton(tr("全部消音"))
         ack_all.clicked.connect(lambda: self._acknowledge(None))
-        refresh = QPushButton("刷新报警")
+        refresh = QPushButton(tr("刷新"))
         refresh.clicked.connect(self.controller.refresh_alarms)
         for button in (ack, ack_all, refresh):
+            button.setObjectName("secondary")
             alarm_toolbar.addWidget(button)
-        alarm_toolbar.addStretch()
         alarms_layout.addLayout(alarm_toolbar)
         self.alarm_table = QTableWidget(0, 9)
-        self.alarm_table.setHorizontalHeaderLabels(["时间", "设备", "来源", "测点", "指标", "测量值", "阈值", "状态", "确认 / 消音"])
+        self.alarm_table.setHorizontalHeaderLabels([
+            tr("时间"), tr("设备"), tr("来源"), tr("测点"), tr("指标"), tr("测量值"),
+            tr("阈值"), tr("状态"), tr("确认 / 消音"),
+        ])
         self.alarm_table.verticalHeader().setDefaultSectionSize(28)
         self.alarm_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.alarm_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.alarm_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.alarm_table.horizontalHeader().setStretchLastSection(True)
         alarms_layout.addWidget(self.alarm_table, 1)
-        tabs.addTab(alarms, "阈值与报警")
-        for widget in (device_label, self.device_combo, self.retry_device_button):
-            tabs.currentChanged.connect(lambda index, field=widget: field.setVisible(index != 0))
-            widget.hide()
+        tabs.addTab(alarms, tr("报警记录"))
+        self._device_combos = (self.device_combo, self.alarm_device_combo)
+        self._device_retries = (self.retry_device_button, self.retry_alarm_device_button)
+        self._device_loaders = (self.device_loading, self.alarm_device_loading)
+        tabs.currentChanged.connect(self.tab_changed.emit)
+        for widget in (self.poll_seconds, self.history_seconds, self.temp_offset, self.humidity_offset):
+            widget.valueChanged.connect(self._update_draft_notice)
+        for editor in self.threshold_inputs.values():
+            editor.textChanged.connect(self._update_draft_notice)
         self._update_enabled()
+
+    def _device_toolbar(self):
+        panel = FilterPanel()
+        combo = QComboBox()
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(12)
+        combo.currentIndexChanged.connect(lambda index: self._device_changed(combo))
+        panel.add_field(tr("分机"), combo)
+        actions = QWidget()
+        row = QHBoxLayout(actions)
+        row.setContentsMargins(0, 0, 0, 0)
+        loading = QLabel()
+        loading.setObjectName("muted")
+        row.addWidget(loading)
+        retry = QPushButton(tr("重新读取"))
+        retry.setObjectName("secondary")
+        retry.setToolTip(tr("重新读取所选分机的微调和报警阈值"))
+        retry.clicked.connect(self._reload_device_parameters)
+        row.addWidget(retry)
+        panel.add_action(actions)
+        return panel, combo, retry, loading
+
+    def current_tab(self):
+        return self._tabs.currentIndex()
+
+    def set_tab(self, index):
+        self._tabs.setCurrentIndex(index)
 
     def reload_settings(self):
         self._load_globals()
@@ -212,12 +278,12 @@ class SettingsPage(QWidget):
 
     def _intervals_loaded(self, value):
         if not isinstance(value, dict):
-            self._intervals_failed("全局采集设置格式无效")
+            self._intervals_failed(tr("全局采集设置格式无效"))
             return
         poll, history = value.get("poll_seconds", 5), value.get("history_seconds", 30)
         if (type(poll) is not int or not 1 <= poll <= self.poll_seconds.maximum()
                 or type(history) is not int or not 1 <= history <= self.history_seconds.maximum()):
-            self._intervals_failed("全局采集设置超出允许范围")
+            self._intervals_failed(tr("全局采集设置超出允许范围"))
             return
         self._collection_busy = False
         self.poll_seconds.setValue(poll)
@@ -242,14 +308,14 @@ class SettingsPage(QWidget):
             self._interval_baseline = (poll, history)
             self.controller.set_intervals(poll, history, persist=False)
             self._update_enabled()
-            self.message.setText("所有分机的采集与保存周期已应用，已有历史记录保留。")
+            self._show_message(tr("所有分机的采集与保存周期已应用，已有历史记录保留。"))
 
         self.repo.call("set_setting", "collection", {"poll_seconds": poll, "history_seconds": history},
                        callback=saved, on_error=self._intervals_failed)
 
     def _sound_loaded(self, value):
         if not isinstance(value, bool):
-            self._sound_failed("报警声音设置格式无效")
+            self._sound_failed(tr("报警声音设置格式无效"))
             return
         self._sound_busy = False
         self._sound_ready = True
@@ -274,22 +340,23 @@ class SettingsPage(QWidget):
 
         def saved(_):
             self._sound_loaded(bool(checked))
-            self.message.setText("报警声音已开启。" if checked else "报警声音已关闭，报警记录继续保存。")
+            self._show_message(tr("报警声音已开启。") if checked else tr("报警声音已关闭，报警记录继续保存。"))
 
         self.repo.call("set_setting", "sound_enabled", bool(checked), callback=saved, on_error=self._sound_failed)
 
     def _metadata_changed(self, metadata):
         previous = self._active_device
         self._devices = {device["id"]: dict(device) for device in metadata.get("devices", [])}
-        with QSignalBlocker(self.device_combo):
-            self.device_combo.clear()
-            for device in self._devices.values():
-                source = "模拟" if device.get("source") == "simulator" else "串口"
-                self.device_combo.addItem(f"{device.get('warehouse_name', '')} / {device['name']}（{source}）", device["id"])
-            index = self.device_combo.findData(previous)
-            self.device_combo.setCurrentIndex(max(0, index))
-        if previous != self.device_combo.currentData():
-            self._select_device(self.device_combo.currentData())
+        identifier = previous if previous in self._devices else next(iter(self._devices), None)
+        for combo in self._device_combos:
+            with QSignalBlocker(combo):
+                combo.clear()
+                for device in self._devices.values():
+                    source = tr("模拟") if device.get("source") == "simulator" else tr("串口")
+                    combo.addItem(f"{device.get('warehouse_name', '')} / {device['name']}（{source}）", device["id"])
+                combo.setCurrentIndex(combo.findData(identifier))
+        if previous != identifier:
+            self._select_device(identifier)
         elif not self._device_dirty() and not self._saving:
             self._sync_device_selectors()
             if self._loaded["calibrations"]:
@@ -298,15 +365,17 @@ class SettingsPage(QWidget):
                 self._fill_thresholds()
         self._update_enabled()
 
-    def _device_changed(self, *_):
-        identifier = self.device_combo.currentData()
+    def _device_changed(self, combo):
+        identifier = combo.currentData()
         if identifier == self._active_device:
             return
         if self._saving or (self._device_dirty() and not self._confirm_discard()):
-            with QSignalBlocker(self.device_combo):
-                self.device_combo.setCurrentIndex(self.device_combo.findData(self._active_device))
-            return
-        self._select_device(identifier)
+            identifier = self._active_device
+        for selector in self._device_combos:
+            with QSignalBlocker(selector):
+                selector.setCurrentIndex(selector.findData(identifier))
+        if identifier != self._active_device:
+            self._select_device(identifier)
 
     def _select_device(self, identifier):
         self._active_device = identifier
@@ -335,22 +404,40 @@ class SettingsPage(QWidget):
             self.point_combo.setCurrentIndex(max(0, self.point_combo.findData(previous)))
 
     def _update_enabled(self, *_):
-        self.device_combo.setEnabled(bool(self._devices) and not self._saving)
-        self.retry_device_button.setEnabled(self._active_device is not None and not self._saving)
+        for combo in self._device_combos:
+            combo.setEnabled(bool(self._devices) and not self._saving)
+        for retry in self._device_retries:
+            retry.setEnabled(self._active_device is not None and not self._saving)
         calibration = self._loaded["calibrations"] and not self._saving and self.point_combo.count() > 0
         threshold = self._loaded["thresholds"] and not self._saving and self._points(self.threshold_kind.currentData())
         for widget in (self.kind_combo, self.temp_offset, self.batch_box, self.save_calibration_button):
             widget.setEnabled(bool(calibration))
         self.point_combo.setEnabled(bool(calibration and not self.batch_box.isChecked()))
         self.humidity_offset.setEnabled(bool(calibration and self.kind_combo.currentData() == "ambient"))
+        self._cal_form.setRowVisible(self.humidity_offset, self.kind_combo.currentData() == "ambient")
         self.threshold_kind.setEnabled(bool(threshold))
         self.save_threshold_button.setEnabled(bool(threshold))
         for field, editor in self.threshold_inputs.items():
-            editor.setEnabled(bool(threshold and (not field.startswith("humidity") or self.threshold_kind.currentData() == "ambient")))
+            applies = not field.startswith("humidity") or self.threshold_kind.currentData() == "ambient"
+            editor.setEnabled(bool(threshold and applies))
+            self._threshold_form.setRowVisible(editor, applies)
         global_ready = self._interval_baseline is not None and not self._collection_busy
         for widget in (self.poll_seconds, self.history_seconds, self.intervals_button):
             widget.setEnabled(global_ready)
         self.sound_box.setEnabled(self._sound_ready and not self._sound_busy)
+        for loading in self._device_loaders:
+            loading.setText(tr("正在保存…") if self._saving else tr("正在读取…"))
+            loading.setVisible(bool(self._saving or self._loading))
+        self.global_loading.setText(tr("正在读取…") if self._interval_baseline is None else tr("正在保存…"))
+        self.global_loading.setVisible(self._collection_busy)
+        self._update_draft_notice()
+
+    def _update_draft_notice(self, *_):
+        self.draft_label.setVisible(self._intervals_dirty() or self._device_dirty())
+
+    def _show_message(self, text):
+        self.message.setText(text)
+        self.message.setVisible(bool(text))
 
     def _load_parameters(self, section=None):
         identifier = self._active_device
@@ -360,7 +447,8 @@ class SettingsPage(QWidget):
             for key in sections:
                 self._request_generation[key] += 1
                 self._loaded[key] = False
-            self.calibration_version.setText("请先创建仓房、连接和设备。")
+            self.calibration_version.setText(tr("请先创建仓房、连接和设备。"))
+            self.calibration_version.show()
             self._fill_calibration()
             self._fill_thresholds()
             self._update_enabled()
@@ -375,7 +463,7 @@ class SettingsPage(QWidget):
         self._loading.add(section)
         self._update_enabled()
         if section == "calibrations":
-            self.calibration_version.setText("正在读取微调参数…")
+            self.calibration_version.hide()
 
         def current():
             return identifier == self._active_device and request == self._request_generation[section]
@@ -388,7 +476,7 @@ class SettingsPage(QWidget):
             if section == "calibrations":
                 self._calibrations = {(row["kind"], row["point"]): row for row in rows}
                 version = self._devices[identifier].get("calibration_version", 0)
-                self.calibration_version.setText(f"设备当前修正版本：{version}")
+                self.save_calibration_button.setToolTip(tr('当前修正版本：{version}。仅对后续采集生效。', version=version))
                 self._fill_calibration()
             else:
                 self._thresholds = {row["kind"]: row for row in rows}
@@ -400,7 +488,9 @@ class SettingsPage(QWidget):
                 return
             self._loading.discard(section)
             if section == "calibrations":
-                self.calibration_version.setText("微调参数未加载")
+                self.calibration_version.setText(tr("微调参数未加载"))
+                self.calibration_version.show()
+            self._update_enabled()
             self._error(message)
 
         self.repo.call(section, identifier, callback=loaded, on_error=failed)
@@ -423,7 +513,7 @@ class SettingsPage(QWidget):
 
     def _confirm_discard(self):
         return QMessageBox.question(
-            self, "未保存的设备参数", "放弃当前未保存的参数修改？",
+            self, tr("未保存的设备参数"), tr("放弃当前未保存的参数修改？"),
             QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel) == QMessageBox.StandardButton.Discard
 
@@ -460,12 +550,12 @@ class SettingsPage(QWidget):
         kind, point = self._calibration_point
         points = self._points(kind)
         if point not in points:
-            self._error("当前测点不在设备范围内，请重新选择。")
+            self._error(tr("当前测点不在设备范围内，请重新选择。"))
             return
         identifier = self._active_device
         if self.batch_box.isChecked():
             answer = QMessageBox.question(
-                self, "确认批量微调", f"将修改当前设备的 {len(points)} 个同类测点，是否继续？",
+                self, tr("确认批量微调"), tr('将修改当前设备的 {count} 个同类测点，是否继续？', count=len(points)),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
@@ -479,7 +569,7 @@ class SettingsPage(QWidget):
 
         def saved(version):
             self._saving = None
-            self.message.setText(f"微调参数已保存，共 {len(rows)} 个测点。仅对后续采集生效。")
+            self._show_message(tr('微调参数已保存，共 {count} 个测点。仅对后续采集生效。', count=len(rows)))
             if identifier == self._active_device:
                 self._devices[identifier]["calibration_version"] = version
                 self._load_parameters("calibrations")
@@ -510,7 +600,7 @@ class SettingsPage(QWidget):
             return
         identifier, kind = self._active_device, self._threshold_type
         if not self._points(kind):
-            self._error("当前设备没有此类型的测点，请重新选择。")
+            self._error(tr("当前设备没有此类型的测点，请重新选择。"))
             return
         try:
             values = {}
@@ -521,14 +611,14 @@ class SettingsPage(QWidget):
                     raise ValueError
                 values[field] = value
         except ValueError:
-            self._error("阈值必须填写数字，留空表示不启用。")
+            self._error(tr("阈值必须填写数字，留空表示不启用。"))
             return
         self._saving = "thresholds"
         self._update_enabled()
 
         def saved(_):
             self._saving = None
-            self.message.setText("报警阈值已保存，将根据后续有效采样判断。")
+            self._show_message(tr("报警阈值已保存，将根据后续有效采样判断。"))
             if identifier == self._active_device:
                 self._load_parameters("thresholds")
             self._update_enabled()
@@ -544,12 +634,15 @@ class SettingsPage(QWidget):
         self._alarms = rows
         self.alarm_table.setRowCount(len(rows))
         for index, row in enumerate(rows):
-            source = "模拟数据" if row["source"] == "simulator" else "串口设备"
-            point = f"{'粮温' if row['kind'] == 'grain' else '仓温仓湿'} {row['point']}"
-            metric = ("温度" if row["metric"] == "temp" else "湿度") + ("低于下限" if row["direction"] == "low" else "高于上限")
+            source = tr("模拟数据") if row["source"] == "simulator" else tr("串口设备")
+            point_type = tr("粮温") if row["kind"] == "grain" else tr("仓温仓湿")
+            point = f"{point_type} {row['point']}"
+            measure = tr("温度") if row["metric"] == "temp" else tr("湿度")
+            metric = (tr("{metric}低于下限", metric=measure) if row["direction"] == "low" else
+                      tr("{metric}高于上限", metric=measure))
             values = [row["timestamp"], row.get("device_name", str(row["device_id"])), source, point, metric,
-                      f"{row['value']:.2f}", f"{row['threshold']:.2f}", "当前报警" if row["active"] else "已恢复",
-                      row.get("acknowledged_at") or "未确认"]
+                      f"{row['value']:.2f}", f"{row['threshold']:.2f}", tr("当前报警") if row["active"] else tr("已恢复"),
+                      row.get("acknowledged_at") or tr("未确认")]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setData(Qt.ItemDataRole.UserRole, row["id"])
@@ -563,14 +656,15 @@ class SettingsPage(QWidget):
         if identifiers:
             self._acknowledge(identifiers)
         else:
-            self.message.setText("请选择当前且未确认的报警；已恢复或已确认的记录保持不变。")
+            self._show_message(tr("请选择当前且未确认的报警；已恢复或已确认的记录保持不变。"))
 
     def _acknowledge(self, identifiers):
         def saved(count):
-            self.message.setText(f"已确认并消音{count}条当前报警，记录继续保留。恢复后再次越限会形成新的报警。")
+            self._show_message(tr('已确认并消音{count}条当前报警，记录继续保留。恢复后再次越限会形成新的报警。', count=count))
             self.controller.refresh_alarms()
         self.repo.call("acknowledge_alarms", identifiers, callback=saved, on_error=self._error)
 
     def _error(self, message):
-        self.message.setText(str(message))
-        QMessageBox.warning(self, "操作未完成", str(message))
+        message = tr(str(message))
+        self._show_message(message)
+        QMessageBox.warning(self, tr("操作未完成"), message)

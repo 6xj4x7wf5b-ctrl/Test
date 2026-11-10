@@ -1,11 +1,12 @@
 """Display-only layer mapping; never changes device numbering or probe bindings."""
 from __future__ import annotations
-from .domain import configured_point_keys
-
 from collections import Counter
 from dataclasses import dataclass
 import math
 import re
+
+from .domain import configured_point_keys
+from .i18n import tr
 
 
 @dataclass(frozen=True)
@@ -57,13 +58,13 @@ def build_silo_snapshot(device, rows, layout, *, connected, stale, alarms=()):
     Ring placement is a display convention, not a surveyed physical position.
     """
     if not device:
-        return SiloSnapshot(None, (), "请先选择仓房与分机。", "", 0)
+        return SiloSnapshot(None, (), tr("请先选择仓房与分机。"), "", 0)
     identifier = device["id"]
     grain_points = [point for kind, point in configured_point_keys(device) if kind == "grain"]
     count = len(grain_points)
     source = device.get("source", "serial")
     if not count:
-        return SiloSnapshot(identifier, (), "该分机未配置粮温测点，仓温仓湿见上方环境数据。", source, 0)
+        return SiloSnapshot(identifier, (), tr("该分机未配置粮温测点，仓温仓湿见上方环境数据。"), source, 0)
     records = layout if isinstance(layout, dict) else {}
     labels = {point: tuple(_label(records.get(f"grain:{point}"), field)
                           for field in ("line", "layer", "position"))
@@ -105,23 +106,23 @@ def build_silo_snapshot(device, rows, layout, *, connected, stale, alarms=()):
                                   key=lambda p: slots.index(p.cable)))
             if not points:
                 continue
-            label = f"第{name}层" if name.isdecimal() else name
+            label = tr("第{layer}层", layer=name) if name.isdecimal() else name
             if len(cables) > 24:
-                label += f" · 线组 {start // 24 + 1}"
+                label = tr("{layer} · 线组 {group}", layer=label, group=start // 24 + 1)
             layers.append(SiloLayer(f"layer:{name}:group:{start // 24}", label, slots, points, True))
     for start in range(0, len(unplaced), 24):
         points = tuple(unplaced[start:start + 24])
-        label = "未布点示意"
-        if len(unplaced) > 24:
-            label += f" · 第 {start // 24 + 1} 组"
+        label = (tr("未布点示意 · 第 {group} 组", group=start // 24 + 1)
+                 if len(unplaced) > 24 else tr("未布点示意"))
         layers.append(SiloLayer(f"unplaced:{start // 24}", label,
                                 tuple(p.slot for p in points), points, False))
     if not unplaced:
-        message = "按登记线 / 层展示；层序及环形位置为示意，不代表实际线距与埋深。"
+        message = tr("按登记线 / 层展示；层序及环形位置为示意，不代表实际线距与埋深。")
     elif not located:
-        message = "尚未完成布点：按点号分组示意，请通过“调整布点”登记测温线和层。"
+        message = tr("尚未完成布点：按点号分组示意，请通过“调整布点”登记测温线和层。")
     else:
-        message = f"已布点 {len(located)} 点，未定位 {len(unplaced)} 点；未定位点在“未布点示意”分组中显示。"
+        message = tr("已布点 {located} 点，未定位 {unplaced} 点；未定位点在“未布点示意”分组中显示。",
+                     located=len(located), unplaced=len(unplaced))
     if conflicts:
-        message += f"其中 {conflicts} 点的线 / 层重复，需检查布点。"
+        message += tr("其中 {count} 点的线 / 层重复，需检查布点。", count=conflicts)
     return SiloSnapshot(identifier, tuple(layers), message, source, count)

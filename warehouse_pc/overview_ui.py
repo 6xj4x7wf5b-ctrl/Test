@@ -5,13 +5,15 @@ import math
 import time
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QPushButton, QScrollArea, QStackedWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
 from .domain import configured_point_keys
+from .filter_panel import FilterPanel
+from .i18n import tr
 
 
 def _label(text: str, name: str = "") -> QLabel:
@@ -39,9 +41,54 @@ class _WarehouseCard(QFrame):
         super().mouseReleaseEvent(event)
 
 
+class SummaryCard(QFrame):
+    activated = Signal()
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self._pressed = False
+        self.setAccessibleName(title)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("""
+            QFrame#summaryCard:hover {
+                border-top-color: #8da9ca;
+                border-right-color: #8da9ca;
+                border-bottom-color: #8da9ca;
+            }
+            QFrame#summaryCard:focus {
+                border-top-color: #2f6fdf;
+                border-right-color: #2f6fdf;
+                border-bottom-color: #2f6fdf;
+            }
+        """)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        self._pressed = True
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().mouseReleaseEvent(event)
+        pressed, self._pressed = self._pressed, False
+        event.accept()
+        if pressed and self.rect().contains(event.position().toPoint()):
+            self.activated.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() not in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            return super().keyPressEvent(event)
+        event.accept()
+        if not event.isAutoRepeat():
+            self.activated.emit()
+
+
 class OverviewPage(QWidget):
     detail_requested = Signal(int)
     history_requested = Signal()
+    summary_requested = Signal(str)
 
     def __init__(self, repo, controller, parent=None):
         super().__init__(parent)
@@ -57,10 +104,11 @@ class OverviewPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.viewport().installEventFilter(self)
         self.body = QWidget()
         self.body.setObjectName("overviewBody")
         self.content = QVBoxLayout(self.body)
-        self.content.setContentsMargins(14, 12, 14, 14)
+        self.content.setContentsMargins(0, 0, 0, 0)
         self.content.setSpacing(12)
         self._build_header()
         self._build_home()
@@ -79,141 +127,118 @@ class OverviewPage(QWidget):
         self.set_mode("home")
 
     def _build_header(self):
-        row = QHBoxLayout()
-        copy = QVBoxLayout()
-        copy.setSpacing(2)
-        self.kicker = _label("运行概况", "eyebrow")
-        self.title = _label("首页", "pageTitle")
-        copy.addWidget(self.kicker)
-        copy.addWidget(self.title)
-        row.addLayout(copy)
-        row.addStretch()
-        self.mode_label = _label("模拟数据 · 本地数据库" if self.controller.demo else "本地串口 · 离线运行", "muted")
-        self.mode_label.setWordWrap(False)
-        self.mode_label.setMinimumWidth(200)
-        self.mode_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        row.addWidget(self.mode_label)
-        self.content.addLayout(row)
+        # The application header owns the page title and data-mode badge.
+        self.kicker, self.title, self.mode_label = QLabel(self), QLabel(self), QLabel(self)
+        for label in (self.kicker, self.title, self.mode_label):
+            label.hide()
 
     def _build_home(self):
         self.home_frame = QFrame()
-        self.home_frame.setObjectName("section")
-        self.home_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.home_frame.setObjectName("homeMetrics")
+        self.home_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         home = QVBoxLayout(self.home_frame)
-        home.setContentsMargins(12, 10, 12, 12)
-        home.setSpacing(10)
-        heading = QHBoxLayout()
-        heading.addWidget(_label("粮情监测概况", "cardTitle"))
-        heading.addStretch()
-        self.home_state = _label("尚无采集数据", "muted")
-        heading.addWidget(self.home_state)
-        home.addLayout(heading)
+        home.setContentsMargins(0, 0, 0, 0)
+        home.setSpacing(0)
+        self.home_state = QLabel(self.home_frame)
+        self.home_state.hide()
         grid = QGridLayout()
-        grid.setSpacing(8)
-        self.metric_values: list[QLabel] = []
-        self.metric_notes: list[QLabel] = []
-        specifications = [
-            ("仓房数", "blue", "#2f6fdf", "#edf4fd"),
-            ("在线分机", "green", "#49a56a", "#edf8f0"),
-            ("有效粮温点", "violet", "#7883ea", "#eef1ff"),
-            ("待处理报警", "orange", "#d28f3f", "#fff3e6"),
-            ("仓温 / 仓湿", "blue", "#2f6fdf", "#edf4fd"),
-            ("历史记录", "neutral", "#8da0b3", "#f3f7fb"),
-        ]
-        for index, (title, tone, accent, soft) in enumerate(specifications):
-            card = QFrame()
-            card.setObjectName("card")
-            card.setProperty("tone", tone)
-            card.setMinimumHeight(98)
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            card.setStyleSheet(f"QFrame#card {{ border:1px solid #b9c3ce; border-top:2px solid {accent}; border-radius:2px; background:#f7f9fb; }}")
-            layout = QVBoxLayout(card)
-            layout.setContentsMargins(12, 10, 12, 10)
-            layout.setSpacing(4)
-            layout.addWidget(_label(title, "muted"))
+        grid.setSpacing(10)
+        summary_keys = ("warehouses", "devices", "points", "alarms")
+        self.metric_cards = []
+        self.metric_values, self.metric_notes = [], []
+        for index, title in enumerate((tr('仓房'), tr('在线分机'), tr('有效粮温点'), tr('待处理报警'), tr('仓温 / 仓湿'), tr('历史记录'))):
+            card = SummaryCard(title, self.home_frame) if index < len(summary_keys) else QFrame(self.home_frame)
+            card.setObjectName("summaryCard")
+            card.setProperty("tone", ("blue", "green", "slate", "amber", "slate", "slate")[index])
+            content = QVBoxLayout(card)
+            content.setContentsMargins(14, 10, 12, 10)
+            content.setSpacing(3)
+            content.setAlignment(Qt.AlignmentFlag.AlignTop)
+            content.addWidget(_label(title, "muted"))
             value = _label("—", "metric")
-            value.setStyleSheet("font-size:22px;font-weight:700;background:transparent")
-            note = _label("", "muted")
-            if index == 5:
-                value.hide()
-                action = QPushButton("查看历史记录  →")
-                action.clicked.connect(self.history_requested.emit)
-                layout.addWidget(action, alignment=Qt.AlignmentFlag.AlignLeft)
-            else:
-                layout.addWidget(value)
-            layout.addWidget(note)
+            value.setFixedHeight(30)
+            content.addWidget(value)
+            note = _label("", "sectionMeta")
+            note.setFixedHeight(16)
+            content.addWidget(note)
             self.metric_values.append(value)
             self.metric_notes.append(note)
-            grid.addWidget(card, index // 3, index % 3)
-        for column in range(3):
-            grid.setColumnStretch(column, 1)
+            if index < len(summary_keys):
+                card.activated.connect(lambda key=summary_keys[index]: self.summary_requested.emit(key))
+                self.metric_cards.append(card)
+                grid.addWidget(card, 0, index)
+                grid.setColumnStretch(index, 1)
+            else:
+                card.hide()
         home.addLayout(grid)
         self.home_note = _label("", "muted")
         home.addWidget(self.home_note)
         self.content.addWidget(self.home_frame)
 
     def _build_overview(self):
-        self.filter_frame = QFrame()
-        self.filter_frame.setObjectName("section")
-        self.filter_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        filters = QVBoxLayout(self.filter_frame)
-        filters.setContentsMargins(12, 10, 12, 12)
-        filters.setSpacing(8)
-        filters.addWidget(_label("筛选", "cardTitle"))
-        row = QHBoxLayout()
-        row.setSpacing(10)
+        self.filter_frame = FilterPanel()
         self.keyword = QLineEdit()
-        self.keyword.setPlaceholderText("请输入仓房名称")
+        self.keyword.setPlaceholderText(tr('请输入仓房名称'))
         self.keyword.returnPressed.connect(self.apply_filters)
         self.alarm_filter, self.state_filter = QComboBox(), QComboBox()
-        for label, key in (("全部", "all"), ("有预警", "any"), ("温度预警", "temp"), ("湿度预警", "humidity"), ("无预警", "none")):
+        for label, key in ((tr('全部'), "all"), (tr('有预警'), "any"), (tr('温度预警'), "temp"), (tr('湿度预警'), "humidity"), (tr('无预警'), "none")):
             self.alarm_filter.addItem(label, key)
-        for label, key in (("全部", "all"), ("在线", "online"), ("离线 / 过期", "offline"), ("尚未采集", "pending"), ("未配置分机", "unconfigured")):
+        for label, key in ((tr('全部'), "all"), (tr('在线'), "online"), (tr('离线 / 过期'), "offline"), (tr('尚未采集'), "pending"), (tr('未配置分机'), "unconfigured")):
             self.state_filter.addItem(label, key)
-        for title, widget in (("仓房名称", self.keyword), ("报警类型", self.alarm_filter), ("分机状态", self.state_filter)):
-            column = QVBoxLayout()
-            column.setSpacing(3)
-            column.addWidget(_label(title, "muted"))
-            column.addWidget(widget)
-            row.addLayout(column, 1)
-        query, clear = QPushButton("查询"), QPushButton("清空")
+        for title, widget in ((tr('仓房名称'), self.keyword), (tr('报警类型'), self.alarm_filter), (tr('分机状态'), self.state_filter)):
+            self.filter_frame.add_field(title, widget)
+        query, clear = QPushButton(tr('查询')), QPushButton(tr('清空'))
         query.setObjectName("primary")
         query.clicked.connect(self.apply_filters)
         clear.clicked.connect(self.clear_filters)
-        row.addWidget(query, alignment=Qt.AlignmentFlag.AlignBottom)
-        row.addWidget(clear, alignment=Qt.AlignmentFlag.AlignBottom)
-        filters.addLayout(row)
+        self.filter_frame.add_action(query)
+        self.filter_frame.add_action(clear)
         self.content.addWidget(self.filter_frame)
 
         self.list_frame = QFrame()
         self.list_frame.setObjectName("section")
-        self.list_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.list_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         result = QVBoxLayout(self.list_frame)
         result.setContentsMargins(12, 10, 12, 12)
         result.setSpacing(8)
         heading = QHBoxLayout()
-        heading.addWidget(_label("粮情总览列表", "cardTitle"))
-        heading.addStretch()
-        self.count_label = _label("0 个仓房", "muted")
+        heading.setSpacing(10)
+        heading.addWidget(_label(tr('仓房'), "sectionTitle"))
+        self.count_label = _label(tr('0 个仓房'), "sectionMeta")
         heading.addWidget(self.count_label)
-        self.refresh_button = QPushButton("刷新状态")
+        heading.addStretch()
+        history = QPushButton(tr('历史记录'))
+        history.setObjectName("secondary")
+        history.clicked.connect(self.history_requested.emit)
+        heading.addWidget(history)
+        self.refresh_button = QPushButton(tr('刷新'))
+        self.refresh_button.setObjectName("secondary")
         self.refresh_button.clicked.connect(self.request_refresh)
         heading.addWidget(self.refresh_button)
         self.view_combo = QComboBox()
-        self.view_combo.addItem("卡片展示", "card")
-        self.view_combo.addItem("列表展示", "list")
+        self.view_combo.addItem(tr('卡片展示'), "card")
+        self.view_combo.addItem(tr('列表展示'), "list")
+        self.view_combo.setMinimumWidth(110)
+        self.view_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.view_combo.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.view_combo.currentIndexChanged.connect(self._render_rows)
         heading.addWidget(self.view_combo)
         result.addLayout(heading)
+        divider = QFrame()
+        divider.setObjectName("sectionDivider")
+        divider.setFixedHeight(1)
+        result.addWidget(divider)
         self.views = QStackedWidget()
+        self.views.setObjectName("warehouseViews")
         self.card_area = QWidget()
+        self.card_area.setObjectName("warehouseCardArea")
         self.card_grid = QGridLayout(self.card_area)
         self.card_grid.setContentsMargins(0, 0, 0, 0)
         self.card_grid.setSpacing(8)
         self.card_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.views.addWidget(self.card_area)
         self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["仓房名称", "仓房温度", "仓房湿度", "报警类型", "分机状态", "更新时间", "操作"])
+        self.table.setHorizontalHeaderLabels([tr('仓房名称'), tr('仓房温度'), tr('仓房湿度'), tr('报警类型'), tr('分机状态'), tr('更新时间'), tr('操作')])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -224,9 +249,11 @@ class OverviewPage(QWidget):
         self.views.addWidget(self.table)
         self.views.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         result.addWidget(self.views)
-        self.empty_label = _label("尚无仓房。请先在仓房信息管理中添加仓房，并关联测温分机。", "muted")
+        self.empty_label = _label(tr('尚无仓房。请先在仓房信息管理中添加仓房，并关联测温分机。'), "muted")
         result.addWidget(self.empty_label)
-        pager = QHBoxLayout()
+        self.pager = QWidget()
+        pager = QHBoxLayout(self.pager)
+        pager.setContentsMargins(0, 0, 0, 0)
         pager.addStretch()
         self.prev_button, self.next_button = QPushButton("‹"), QPushButton("›")
         self.prev_button.clicked.connect(lambda: self._turn_page(-1))
@@ -235,18 +262,18 @@ class OverviewPage(QWidget):
         pager.addWidget(self.prev_button)
         pager.addWidget(self.page_label)
         pager.addWidget(self.next_button)
-        result.addLayout(pager)
+        result.addWidget(self.pager)
         self.content.addWidget(self.list_frame)
 
     def set_mode(self, mode: str):
         if mode not in ("home", "overview"):
-            raise ValueError("页面模式必须是 home 或 overview")
+            raise ValueError(tr('页面模式必须是 home 或 overview'))
         self.mode = mode
-        self.title.setText("首页" if mode == "home" else "粮情总览")
-        self.kicker.setText("运行概况" if mode == "home" else "仓房粮情")
+        self.title.setText(tr('首页') if mode == "home" else tr('粮情总览'))
+        self.kicker.setText(tr('运行概况') if mode == "home" else tr('仓房粮情'))
         self.home_frame.setVisible(mode == "home")
         self.filter_frame.setVisible(mode == "overview")
-        self.list_frame.setVisible(mode == "overview")
+        self.list_frame.setVisible(True)
         self.refresh()
 
     def _visible_refresh(self):
@@ -285,17 +312,17 @@ class OverviewPage(QWidget):
             temperature = [r["temp"] for r in ambient if _finite(r.get("temp"))]
             humidity = [r["humidity"] for r in ambient if _finite(r.get("humidity"))]
             alarms = [alarm for alarm in active_alarms if alarm.get("device_id") in ids]
-            labels = {"temp": "温度预警", "humidity": "湿度预警"}
-            alarm_text = "、".join(labels[key] for key in labels if any(a.get("metric") == key for a in alarms)) or ("有预警" if alarms else "无预警")
+            labels = {"temp": tr('温度预警'), "humidity": tr('湿度预警')}
+            alarm_text = "、".join(labels[key] for key in labels if any(a.get("metric") == key for a in alarms)) or (tr('有预警') if alarms else tr('无预警'))
             if not self._alarms_loaded:
-                alarm_text = "报警状态尚未读取"
+                alarm_text = tr('报警状态尚未读取')
             timestamps = [str(row.get("timestamp", "")) for identifier in ids for row in self.controller.latest.get(identifier, []) if row.get("timestamp")]
-            state_label = {"online": f"在线 {online}/{len(devices)}", "pending": "尚未采集", "offline": "离线 / 数据过期", "unconfigured": "未配置分机"}[state]
+            state_label = {"online": tr('在线 {p0}/{p1}', p0=online, p1=len(devices)), "pending": tr('尚未采集'), "offline": tr('离线 / 数据过期'), "unconfigured": tr('未配置分机')}[state]
             rows.append({"id": warehouse["id"], "name": warehouse["name"], "devices": devices,
                          "first_device": devices[0]["id"] if devices else None,
                          "temperature": _number(temperature, "℃"), "humidity": _number(humidity, "%RH"),
                          "state": state, "state_label": state_label, "alarms": alarms, "alarm_text": alarm_text,
-                         "updated": max(timestamps).replace("T", " ") if timestamps else "尚未接收"})
+                         "updated": max(timestamps).replace("T", " ") if timestamps else ""})
         flattened = [row for values in valid.values() for row in values]
         pending = sum(1 for row in self._alarms if row.get("active") and not row.get("acknowledged_at"))
         stats = {"online": sum(state == "online" for state in states.values()),
@@ -314,21 +341,22 @@ class OverviewPage(QWidget):
         self.metric_values[2].setText(str(stats["grain_valid"]))
         self.metric_values[3].setText(("≥" if stats["pending"] >= 500 else "") + str(stats["pending"]) if self._alarms_loaded else "—")
         self.metric_values[4].setText(f"{_number(stats['ambient_temp'], '℃')} / {_number(stats['ambient_humidity'], '%RH')}")
-        notes = ["本地仓房档案", f"共 {len(metadata['devices'])} 台，需串口连接且最近接收未过期",
-                 f"已配置 {grain_capacity} 个粮温点，故障及过期值不计入", "正在触发且尚未确认的报警",
-                 f"{len(stats['ambient_temp'])} 个有效环境测点的平均值", "查看本地历史曲线和采集记录"]
+        notes = ["", tr('共 {p0} 台', p0=len(metadata['devices'])), tr('共 {p0} 个测点', p0=grain_capacity), tr('需要确认') if stats["pending"] else ""]
         for label, text in zip(self.metric_notes, notes):
             label.setText(text)
-        self.home_state.setText("正在采集" if self.controller.running else "采集已暂停")
-        self.home_note.setText("尚无仓房档案，请先添加仓房、串口和测温分机。" if not rows else
-                               "仅使用本地接收的有效数据。串口已连接不代表全部分机在线；停止采集后旧读数会按时效失效。")
-        keyword, alarm, state = self._filters
+            label.setToolTip(text)
+        self.metric_values[1].setToolTip(tr('串口已打开且最近接收未过期；不等同于每个探头均正常。'))
+        self.metric_values[2].setToolTip(tr('只统计有效粮温测点，故障和过期数据不计入。'))
+        self.metric_values[3].setStyleSheet("color:#b44b3d;" if stats["pending"] else "")
+        self.home_state.setText(tr('正在采集') if self.controller.running else tr('采集已暂停'))
+        self.home_note.hide()
+        keyword, alarm, state = self._filters if self.mode == "overview" else ("", "all", "all")
         self._rows = [row for row in rows if keyword.casefold() in row["name"].casefold()
                       and (state == "all" or row["state"] == state)
                       and (alarm == "all" or self._alarms_loaded and (alarm == "any" and row["alarms"]
                            or alarm == "none" and not row["alarms"]
                            or alarm in ("temp", "humidity") and any(a.get("metric") == alarm for a in row["alarms"])))]
-        self.count_label.setText(f"{len(self._rows)} 个仓房")
+        self.count_label.setText(tr('{p0} 个仓房', p0=len(self._rows)))
         self._render_rows()
 
     def request_refresh(self):
@@ -365,9 +393,10 @@ class OverviewPage(QWidget):
         self.page_label.setText(f"{self._page + 1} / {page_count}")
         self.prev_button.setEnabled(self._page > 0)
         self.next_button.setEnabled(self._page + 1 < page_count)
+        self.pager.setVisible(page_count > 1)
         self.empty_label.setVisible(not selected)
         if not selected:
-            self.empty_label.setText("当前筛选条件下暂无仓房。" if self.controller.metadata["warehouses"] else "尚无仓房。请先在仓房信息管理中添加仓房，并关联测温分机。")
+            self.empty_label.setText(tr('当前筛选条件下暂无仓房。') if self.controller.metadata["warehouses"] else tr('尚无仓房。请先在仓房信息管理中添加仓房，并关联测温分机。'))
         card_mode = self.view_combo.currentData() == "card"
         self.views.setCurrentIndex(0 if card_mode else 1)
         self.views.setVisible(bool(selected))
@@ -375,8 +404,8 @@ class OverviewPage(QWidget):
             self.table.setRowCount(len(selected))
             for index, row in enumerate(selected):
                 for column, value in enumerate((row["name"], row["temperature"], row["humidity"], row["alarm_text"], row["state_label"], row["updated"])):
-                    self.table.setItem(index, column, QTableWidgetItem(str(value)))
-                action = QPushButton("查看粮情")
+                    self.table.setItem(index, column, QTableWidgetItem(str(value) if value else (tr("尚未接收") if column == 5 else "")))
+                action = QPushButton(tr('查看粮情'))
                 action.setMaximumHeight(26)
                 action.setMaximumWidth(94)
                 action.setEnabled(row["first_device"] is not None)
@@ -395,28 +424,36 @@ class OverviewPage(QWidget):
                 card, _, _ = self._cards.pop(identifier)
                 self.card_grid.removeWidget(card)
                 card.deleteLater()
-        columns = max(1, min(len(selected), 3 if self.body.width() >= 900 else 2))
+        available_width = max(220, self.scroll.viewport().width() - 26)
+        columns = min(4, max(1, (available_width + 8) // 248))
+        column_width = min(280, (available_width - 8 * (columns - 1)) // columns)
+        row_heights = {}
         for index, row in enumerate(selected):
             if row["id"] not in self._cards:
                 card = _WarehouseCard()
-                card.setObjectName("card")
+                card.setObjectName("warehouseCard")
                 card.setCursor(Qt.CursorShape.PointingHandCursor)
-                card.setMinimumWidth(240)
-                card.setMinimumHeight(148)
-                card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
                 content = QVBoxLayout(card)
-                content.setContentsMargins(12, 8, 12, 8)
-                content.setSpacing(3)
-                labels = {key: _label("", "cardTitle" if key == "name" else "muted") for key in ("name", "temperature", "humidity", "updated", "state_label", "alarm_text")}
-                content.addWidget(labels["name"])
+                content.setContentsMargins(10, 8, 10, 8)
+                content.setSpacing(4)
+                labels = {key: _label("", "sectionTitle" if key == "name" else "muted") for key in ("name", "temperature", "humidity", "updated", "state_label", "alarm_text")}
+                for key in ("temperature", "humidity"):
+                    labels[key].setStyleSheet("font-size:19px; font-weight:600; color:#263a50;")
+                labels["updated"].setObjectName("sectionMeta")
+                labels["state_label"].setObjectName("sectionMeta")
+                title_row = QHBoxLayout()
+                title_row.addWidget(labels["name"], 1)
+                title_row.addWidget(labels["state_label"])
+                content.addLayout(title_row)
                 environment = QHBoxLayout()
                 environment.setSpacing(8)
                 environment.addWidget(labels["temperature"])
                 environment.addWidget(labels["humidity"])
                 content.addLayout(environment)
                 content.addWidget(labels["updated"])
-                content.addWidget(labels["state_label"])
-                action = QPushButton("查看粮情")
+                action = QPushButton(tr('详情 →'))
+                action.setObjectName("quietButton")
                 action.setMaximumHeight(26)
                 footer = QHBoxLayout()
                 footer.addWidget(labels["alarm_text"], 1)
@@ -427,24 +464,30 @@ class OverviewPage(QWidget):
                 self._cards[row["id"]] = card, labels, action
             card, labels, action = self._cards[row["id"]]
             labels["name"].setText(row["name"])
-            labels["temperature"].setText("仓房温度：" + row["temperature"])
-            labels["humidity"].setText("仓房湿度：" + row["humidity"])
-            labels["updated"].setText("更新时间：" + row["updated"])
-            labels["state_label"].setText("分机状态：" + row["state_label"])
+            labels["temperature"].setText(row["temperature"])
+            labels["temperature"].setToolTip(tr('仓温：有效仓温测点平均值'))
+            labels["humidity"].setText(row["humidity"])
+            labels["humidity"].setToolTip(tr('仓湿：有效仓湿测点平均值'))
+            labels["updated"].setText(tr("更新 {time}", time=row["updated"][-8:]) if row["updated"] else tr("尚未接收"))
+            labels["updated"].setToolTip(row["updated"])
+            labels["state_label"].setText(row["state_label"])
             labels["alarm_text"].setText(row["alarm_text"])
+            labels["alarm_text"].setStyleSheet("color:#b44b3d;" if row["alarms"] else "color:#738295;")
             action.setEnabled(row["first_device"] is not None)
             self.card_grid.addWidget(card, index // columns, index % columns, Qt.AlignmentFlag.AlignTop)
-            column_width = max(240, (self.body.width() - 54 - 8 * (columns - 1)) // columns)
+            card.setFixedWidth(column_width)
             card_height = card.layout().heightForWidth(column_width)
-            card.setFixedHeight(max(148, card_height + 2))
-        for column in range(3):
-            self.card_grid.setColumnStretch(column, 1 if column < columns else 0)
+            card.setFixedHeight(max(118, card_height + 2))
+            grid_row = index // columns
+            row_heights[grid_row] = max(row_heights.get(grid_row, 0), card.height())
+        for column in range(5):
+            self.card_grid.setColumnMinimumWidth(column, 0)
+            self.card_grid.setColumnStretch(column, 1 if column == columns else 0)
         self.card_grid.invalidate()
-        width = max(240, self.body.width() - 54)
-        height = self.card_grid.heightForWidth(width)
-        if height < 0:
-            height = self.card_area.sizeHint().height()
-        self.views.setFixedHeight(max(148, height))
+        # Newly inserted cards may not be shown yet, so Qt's cached layout hint
+        # can still describe the previous page. Size all rows from their cards.
+        height = sum(row_heights.values()) + max(0, len(row_heights) - 1) * self.card_grid.verticalSpacing()
+        self.views.setFixedHeight(max(118, height))
 
     def _open_warehouse(self, identifier):
         row = next((row for row in self._rows if row["id"] == identifier), None)
@@ -453,5 +496,11 @@ class OverviewPage(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, "views") and self.mode == "overview":
+        if hasattr(self, "views"):
             self._render_rows()
+
+    def eventFilter(self, watched, event):
+        if watched is self.scroll.viewport() and event.type() == QEvent.Type.Resize:
+            # Reflow from the available viewport, not the old grid's minimum width.
+            QTimer.singleShot(0, self._render_rows)
+        return super().eventFilter(watched, event)

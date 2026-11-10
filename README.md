@@ -8,12 +8,20 @@ Windows 11 离线串口上位机，使用 Python 3.11、PySide6、PyQtGraph 和 
 
 2026-11-10 / 0.1.2：登记改为本地编辑、统一保存与分页回读；设备页面拆分、单支路隐藏、按实际登记点采集，并加强参数加载、导出和清理保护。
 
+2026-11-10 / 0.1.3：整理界面层级。统一顶栏标题、减少重复说明与并列按钮，低频操作收进“更多”，异常和未保存状态继续直接显示。仓房列表按内容收紧，首页采用浅色统计卡和紧凑仓房卡；设置页标签位置固定，分机选择归入对应页签，标题与侧栏随页签同步。当前为 macOS 界面预览。
+
+页面筛选与分机选择统一为独立、满宽的白色面板：字段标签在上方，查询操作靠右。历史记录与曲线共享两行查询面板，列表新增、刷新等操作与筛选分开。
+
+2026-11-10 / 0.1.4：系统维护菜单更名为系统设置，新增语言设置（简体中文、English、Deutsch、Français、Русский、跟随系统），离线保存，重启生效。首次启动时选择语言并直接进入对应界面；跟随系统遇到不支持的语言回退中文。界面、常用提示和确认操作支持翻译；用户档案名、协议标识和底层原始诊断不翻译。首页四张统计卡支持鼠标及 Enter/空格跳转到仓房、分机、测点列表和报警记录。当前为 macOS 源码预览，尚未重新生成 Windows 包。
+
+2026-11-10 / 0.1.5：首次启动在主界面前选择语言，已有有效语言偏好不重复询问；退出选择窗口不写入偏好。修复探头登记摘要中的已保存/未保存计数。操作流程见 [上位机使用手册](docs/上位机使用手册.md)，Windows 交付包附带同名文本手册。
+
 ## macOS 启动
 
 已建立项目独立 Conda 环境：
 
 ```text
-/Users/ly/Projects/WarehouseTemperatureSystem/.conda/warehouse-pc
+/path/to/WarehouseTemperatureSystem/.conda/warehouse-pc
 ```
 
 可双击本目录的脚本：
@@ -24,8 +32,8 @@ Windows 11 离线串口上位机，使用 Python 3.11、PySide6、PyQtGraph 和 
 也可在终端运行：
 
 ```bash
-conda activate /Users/ly/Projects/WarehouseTemperatureSystem/.conda/warehouse-pc
-cd /Users/ly/Projects/WarehouseTemperatureSystem/desktop
+conda activate /path/to/WarehouseTemperatureSystem/.conda/warehouse-pc
+cd /path/to/WarehouseTemperatureSystem/desktop
 python -m warehouse_pc
 python -m warehouse_pc --demo
 ```
@@ -37,7 +45,7 @@ python -m warehouse_pc --data-dir /path/to/warehouse-data
 python -m warehouse_pc --demo --data-dir /path/to/warehouse-data
 ```
 
-模拟模式会在所选目录下追加 `demo/`，与正常数据库隔离。默认目录由系统决定，可在“系统维护 → 本地维护”查看并打开。同一数据目录只允许一个程序实例运行。
+模拟模式会在所选目录下追加 `demo/`，与正常数据库隔离。默认目录由系统决定，可在“系统设置 → 本地维护”查看并打开。同一数据目录只允许一个程序实例运行。
 
 ## Windows 11 环境与打包
 
@@ -103,7 +111,7 @@ python -m warehouse_pc
 
 - 当前协议针对本次 **GXHT3W 单总线固件**，支持 LC-M3 查询、Modbus RTU 查询和 `0x41` 私有登记命令。上位机选择采集协议；分机按每条请求识别并回复。
 - 即使采集选择 LC-M3，登记仍在同一串口参数下使用 `0x41` 维护命令。旧固件不具备此登记功能。
-- 当前 V0.4 固件参数为 **1200、8N1**。串口设置必须与实际固件一致，不能仅因都使用 LC-M3 就认为旧分机无需调整。
+- 当前 V0.5 固件参数为 **1200、8N1**。串口设置必须与实际固件一致，不能仅因都使用 LC-M3 就认为旧分机无需调整。
 - 当前界面分机地址范围为 1～247，粮温最多 165 点、仓温仓湿最多 5 点。Modbus 粮温分批读取，每次不超过 125 个寄存器。
 - 无效值和 `FF FF` 作为故障处理，不作为正常零值。时间显示为电脑接收时间；通信在线不等于每个传感器正常。
 
@@ -112,7 +120,7 @@ python -m warehouse_pc
 ## 微调、采集与报警
 
 - 默认每 **5 秒**轮询、每 **30 秒**保存一轮历史，可在“采集规则 → 测温分机采集规则”调整。实际频率受串口速度、点数和设备响应影响。
-- “系统维护 → 温湿度微调”按分机和测点设置加减偏移；温度单位为 ℃，湿度偏移为 `%RH` 百分点。**仅在电脑端应用一次**，不会写入探头或分机标定区。
+- “系统设置 → 温湿度微调”按分机和测点设置加减偏移；温度单位为 ℃，湿度偏移为 `%RH` 百分点。**仅在电脑端应用一次**，不会写入探头或分机标定区。
 - 显示、历史和超限判断共用修正后的有效数值。历史保留原值、当时修正结果及配置版本，修改微调不会重新计算旧历史。
 - 在“报警记录”页设置温度/湿度上下限；开启声音后，有活动且未确认的报警时每 **10 秒**调用系统提示音。确认或全部消音可停止相应提示，确认不代表测量值已恢复正常；电脑声音设置会影响实际可听效果。
 
@@ -152,7 +160,7 @@ python -m warehouse_pc
 在本目录、独立环境中运行测试：
 
 ```bash
-conda activate /Users/ly/Projects/WarehouseTemperatureSystem/.conda/warehouse-pc
+conda activate /path/to/WarehouseTemperatureSystem/.conda/warehouse-pc
 python -m pytest -q
 ```
 

@@ -8,10 +8,13 @@ from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QScrollArea, QSpinBox, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView, QBoxLayout, QSizePolicy,
+    QHeaderView, QLabel, QMenu, QPushButton, QScrollArea, QSpinBox, QTabWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .devices_ui import button, fill_table, table
+from .filter_panel import FilterPanel
+from .i18n import tr
 from .silo_model import build_silo_snapshot
 from .silo_ui import SiloView
 
@@ -36,63 +39,54 @@ class LivePage(QWidget):
         self._display_rows = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-        hero = QFrame()
-        hero.setObjectName("hero")
-        hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(12, 10, 12, 10)
-        hero_layout.setSpacing(7)
-        hero.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
-        kicker = QLabel("粮情监测")
-        kicker.setObjectName("eyebrow")
-        hero_layout.addWidget(kicker)
-        self.hero_title = QLabel("选择仓房")
-        self.hero_title.setObjectName("cardTitle")
-        hero_layout.addWidget(self.hero_title)
-        filters = QHBoxLayout()
-        filters.addWidget(QLabel("仓房"))
+        layout.setSpacing(8)
+        filters = FilterPanel()
         self.warehouse = QComboBox()
+        self.warehouse.setPlaceholderText(tr("暂无仓房"))
         self.device = QComboBox()
-        self.warehouse.setMinimumWidth(140)
-        self.warehouse.setMaximumWidth(210)
-        self.device.setMinimumWidth(190)
-        self.device.setMaximumWidth(280)
-        filters.addWidget(self.warehouse)
-        filters.addWidget(QLabel("分机"))
-        filters.addWidget(self.device)
-        filters.addStretch()
-        hero_layout.addLayout(filters)
-        metrics = QGridLayout()
-        metrics.setSpacing(6)
+        self.device.setPlaceholderText(tr("暂无分机"))
+        for label, selector in (("仓房", self.warehouse), ("分机", self.device)):
+            selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            selector.setMinimumContentsLength(8)
+            filters.add_field(tr(label), selector)
+        self.source = QLabel(tr("模拟数据"))
+        self.source.setObjectName("muted")
+        self.source.setStyleSheet("color:#856128; font-weight:600;")
+        self.source.hide()
+        filters.add_action(self.source)
+        self.communication = QLabel()
+        self.communication.setObjectName("muted")
+        self.communication.setAccessibleName(tr("当前分机通信"))
+        self.communication.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.communication.setMinimumWidth(self.communication.fontMetrics().horizontalAdvance(tr("串口已打开 · 待查询")))
+        self.communication.setMinimumHeight(self.device.minimumSizeHint().height())
+        filters.add_action(self.communication)
+        layout.addWidget(filters)
+
+        summary = QFrame()
+        summary.setObjectName("section")
+        metrics = QHBoxLayout(summary)
+        metrics.setContentsMargins(10, 6, 10, 6)
+        metrics.setSpacing(14)
         self.metrics = []
-        metric_titles = ("当前分机通信", "有效测点", "报警信息", "仓内环境 · ℃ / %RH", "粮温区间", "平均粮温")
-        tones = ("#607b96", "#7b8796", "#92745b", "#5e7fa1", "#947378", "#93816a")
-        for i, title in enumerate(metric_titles):
-            card = QFrame()
-            card.setObjectName("detailMetric")
-            card.setFixedHeight(50)
-            card.setStyleSheet(f"QFrame#detailMetric {{ background:#f4f6f8; border:1px solid #cfd6df; border-left:3px solid {tones[i]}; border-radius:2px; }}")
-            content = QVBoxLayout(card)
-            content.setContentsMargins(10, 6, 10, 6)
-            content.setSpacing(3)
+        for title in ("有效测点", "待处理报警", "仓温 / 仓湿", "粮温范围 / 平均"):
+            title = tr(title)
+            content = QVBoxLayout()
+            content.setSpacing(2)
             label = QLabel(title)
-            label.setStyleSheet("color:#68768a; font-size:11px; font-weight:600; background:transparent;")
+            label.setObjectName("muted")
             value = QLabel("—")
-            value.setStyleSheet("color:#213043; font-size:14px; font-weight:700; background:transparent;")
+            value.setObjectName("sectionTitle")
+            value.setAccessibleName(title)
             content.addWidget(label)
             content.addWidget(value)
             self.metrics.append(value)
-            metrics.addWidget(card, i // 3, i % 3)
-        hero_layout.addLayout(metrics)
-        self.note = QLabel("尚未配置设备。请在“测温分机管理”中添加仓房、串口和分机。")
-        self.note.setObjectName("muted")
-        self.note.setWordWrap(True)
-        hero_layout.addWidget(self.note)
-        layout.addWidget(hero)
+            metrics.addLayout(content, 1)
+        layout.addWidget(summary)
         self.plot = pg.PlotWidget(background="w")
         self.plot.setMinimumHeight(130)
-        self.plot.setLabel("left", "温度", units="℃", **{"font-size": "11px"})
-        self.plot.setLabel("bottom", "粮温测点编号", **{"font-size": "11px"})
+        self.plot.setLabel("left", tr("温度"), units="℃", **{"font-size": "11px"})
+        self.plot.setLabel("bottom", tr("粮温测点编号"), **{"font-size": "11px"})
         tick_font = QFont(self.plot.font())
         tick_font.setPixelSize(11)
         for name in ("left", "bottom"):
@@ -103,26 +97,55 @@ class LivePage(QWidget):
         self.plot.showGrid(x=True, y=True, alpha=0.12)
         self.curve = self.plot.plot(pen=pg.mkPen("#2f6fdf", width=2), symbol="o", symbolSize=4,
                                     symbolBrush="#2f6fdf", connect="finite")
-        self.workspace = QBoxLayout(QBoxLayout.Direction.LeftToRight)
-        self.workspace.setSpacing(12)
         stage = QFrame()
         stage.setObjectName("stage")
         stage_layout = QVBoxLayout(stage)
-        stage_layout.setContentsMargins(10, 10, 10, 10)
-        stage_layout.setSpacing(6)
-        stage_kicker = QLabel("粮仓测点")
-        stage_kicker.setObjectName("eyebrow")
-        stage_layout.addWidget(stage_kicker)
-        stage_title = QLabel("温度点视图")
-        stage_title.setObjectName("cardTitle")
-        stage_layout.addWidget(stage_title)
+        stage_layout.setContentsMargins(8, 7, 8, 8)
+        stage_layout.setSpacing(7)
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        stage_title = QLabel(tr("测温视图"))
+        stage_title.setObjectName("sectionTitle")
+        controls.addWidget(stage_title)
+        self.reading_status = QLabel()
+        self.reading_status.setObjectName("muted")
+        self.reading_status.setWordWrap(True)
+        controls.addWidget(self.reading_status, 1)
+        self.collect_button = button(tr("采集一次"), self.collect_current, True)
+        self.collect_button.setToolTip(tr("立即采集所选分机"))
+        controls.addWidget(self.collect_button)
+        self.history_button = button(tr("历史曲线"), lambda: self.action_requested.emit("history"))
+        self.history_button.setObjectName("quietButton")
+        controls.addWidget(self.history_button)
+        self.more_button = QPushButton(tr("更多"))
+        self.more_button.setObjectName("quietButton")
+        self.more_button.setAccessibleName(tr("更多分机操作"))
+        menu = QMenu(self.more_button)
+        menu.addAction(tr("查询分机在线状态"), self.query_current)
+        menu.addSeparator()
+        for title, action in (("探头登记", "register"), ("调整布点", "layout"),
+                              ("温湿度微调", "calibration"), ("导出报表", "export")):
+            menu.addAction(tr(title), lambda checked=False, key=action: self.action_requested.emit(key))
+        self.more_button.setMenu(menu)
+        controls.addWidget(self.more_button)
+        stage_layout.addLayout(controls)
         self.tabs = QTabWidget()
         self.silo_view = SiloView()
         self.silo_view.edit_requested.connect(self.edit_layout)
         self.silo_view.point_selected.connect(self._select_silo_point)
-        self.tabs.addTab(self.silo_view, "粮仓立体图")
-        self.table = table(["测点", "线 / 层 / 位置", "原温 ℃", "修正温 ℃", "湿度 %RH", "状态", "最近接收", "来源"])
-        self.tabs.addTab(self.table, "测点列表")
+        self.silo_view.edit_button.hide()
+        self.silo_view.message_label.hide()
+        silo_controls = self.silo_view.layout().itemAt(0).layout()
+        silo_controls.setStretchFactor(self.silo_view.layer_combo, 0)
+        silo_controls.insertStretch(silo_controls.indexOf(self.silo_view.expand_button), 1)
+        self.silo_view.expand_button.setObjectName("quietButton")
+        self.tabs.addTab(self.silo_view, tr("粮仓立体图"))
+        headers = [tr(title) for title in ("测点", "线 / 层 / 位置", "原温 ℃", "修正温 ℃", "湿度 %RH", "状态", "最近接收", "来源")]
+        self.table = table(headers)
+        for column, title in enumerate(headers):
+            self.table.horizontalHeaderItem(column).setToolTip(title)
+        self.table.horizontalHeaderItem(6).setToolTip(tr("上位机接收数据时的电脑时间"))
+        self.tabs.addTab(self.table, tr("测点列表"))
         self.matrix_scroll = QScrollArea()
         self.matrix_scroll.setWidgetResizable(True)
         self.matrix_widget = QWidget()
@@ -137,38 +160,12 @@ class LivePage(QWidget):
         self._matrix_reflow_timer.timeout.connect(self._reflow_matrix)
         self.matrix_scroll.setWidget(self.matrix_widget)
         self.matrix_scroll.viewport().installEventFilter(self)
-        self.tabs.addTab(self.matrix_scroll, "测点平铺图")
-        self.tabs.addTab(self.plot, "粮温分布")
+        self.tabs.addTab(self.matrix_scroll, tr("测点平铺图"))
+        self.tabs.addTab(self.plot, tr("粮温分布"))
         self.tabs.setCurrentIndex(0)
         self.tabs.setMinimumHeight(250)
         stage_layout.addWidget(self.tabs, 1)
-        self.workspace.addWidget(stage, 1)
-        self.console = QFrame()
-        self.console.setObjectName("console")
-        console = QVBoxLayout(self.console)
-        console.setContentsMargins(12, 10, 12, 10)
-        console.setSpacing(8)
-        caption = QLabel("实时控制台")
-        caption.setObjectName("eyebrow")
-        console.addWidget(caption)
-        caption = QLabel("功能操作")
-        caption.setObjectName("cardTitle")
-        console.addWidget(caption)
-        console.addWidget(button("采集当前分机一次", self.collect_current, True))
-        console.addWidget(button("查询分机在线状态", self.query_current))
-        entries = QGridLayout()
-        for i, (text, action) in enumerate((("探头登记", "register"), ("调整布点", "layout"),
-                                             ("温湿度微调", "calibration"), ("历史曲线", "history"),
-                                             ("导出报表", "export"))):
-            entries.addWidget(button(text, lambda _, a=action: self.action_requested.emit(a)), i // 2, i % 2)
-        console.addLayout(entries)
-        console.addStretch()
-        self.console_summary = QLabel("尚未选择分机")
-        self.console_summary.setObjectName("muted")
-        self.console_summary.setWordWrap(True)
-        console.addWidget(self.console_summary)
-        self.workspace.addWidget(self.console)
-        layout.addLayout(self.workspace, 1)
+        layout.addWidget(stage, 1)
         self.warehouse.currentIndexChanged.connect(self._filter_devices)
         self.device.currentIndexChanged.connect(self.refresh)
         self.tabs.currentChanged.connect(self.refresh)
@@ -181,6 +178,7 @@ class LivePage(QWidget):
         self.refresh_timer.setInterval(2000)
         self.refresh_timer.timeout.connect(self.refresh)
         self.refresh_timer.start()
+        self.refresh()
 
     def collect_current(self):
         identifier = self.device.currentData()
@@ -191,13 +189,6 @@ class LivePage(QWidget):
         device = self.controller.device(self.device.currentData())
         if device:
             self.controller.query_online(device)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        side_by_side = self.width() >= 800
-        self.workspace.setDirection(QBoxLayout.Direction.LeftToRight if side_by_side else QBoxLayout.Direction.TopToBottom)
-        self.console.setMinimumWidth(230 if side_by_side else 0)
-        self.console.setMaximumWidth(250 if side_by_side else 16777215)
 
     def eventFilter(self, watched, event):
         if watched is self.matrix_scroll.viewport() and event.type() == QEvent.Type.Resize:
@@ -247,8 +238,10 @@ class LivePage(QWidget):
         selected = self.warehouse.currentData()
         self.warehouse.blockSignals(True)
         self.warehouse.clear()
-        self.warehouse.addItem("全部仓房", None)
-        for row in metadata["warehouses"]:
+        warehouses = metadata["warehouses"]
+        if warehouses:
+            self.warehouse.addItem(tr("全部仓房"), None)
+        for row in warehouses:
             self.warehouse.addItem(row["name"], row["id"])
         self.warehouse.setCurrentIndex(max(0, self.warehouse.findData(selected)))
         self.warehouse.blockSignals(False)
@@ -258,9 +251,11 @@ class LivePage(QWidget):
         selected = self.device.currentData()
         self.device.blockSignals(True)
         self.device.clear()
+        warehouse_id = self.warehouse.currentData()
         for row in self.controller.metadata["devices"]:
-            if self.warehouse.currentData() in (None, row["warehouse_id"]):
-                self.device.addItem(f"{row['name']} · {row['warehouse_name']}", row["id"])
+            if warehouse_id in (None, row["warehouse_id"]):
+                name = f"{row['name']} · {row['warehouse_name']}" if warehouse_id is None else row["name"]
+                self.device.addItem(name, row["id"])
         self.device.setCurrentIndex(max(0, self.device.findData(selected)))
         self.device.blockSignals(False)
         self.refresh()
@@ -284,24 +279,33 @@ class LivePage(QWidget):
         self._matrix_columns = 0
 
     def refresh(self, *_):
-        connected = sum(self.controller.manager.is_connected(str(p["id"])) for p in self.controller.metadata["ports"])
-        self.metrics[0].setText("—")
         identifier = self.device.currentData()
         device = self.controller.device(identifier)
+        for control in (self.collect_button, self.history_button, self.more_button):
+            control.setEnabled(device is not None)
+        self.source.setVisible(bool(device and device["source"] == "simulator" and not self.controller.demo))
         if not device:
-            for metric in self.metrics[1:]:
+            self.communication.clear()
+            self.communication.setToolTip("")
+            self.device.setToolTip("")
+            for metric in self.metrics:
                 metric.setText("—")
-            self.hero_title.setText("尚未配置仓房与分机")
+            self.metrics[1].setStyleSheet("")
+            self.reading_status.clear()
             self.table.setRowCount(0)
             self.curve.setData([], [])
             self._display_rows = []
             self.silo_view.set_snapshot(build_silo_snapshot(None, [], {}, connected=False, stale=False))
+            self.silo_view.message_label.hide()
+            self.silo_view.layer_combo.setToolTip("")
             self._clear_matrix()
             self._reflow_matrix()
-            self.note.setText("尚未配置设备。请在“测温分机管理”中添加仓房、串口和分机。")
             return
-        self.hero_title.setText(f"{device['warehouse_name']} · {device['name']}")
-        self.metrics[0].setText(self.controller.communication_state(device))
+        self.device.setToolTip(self.device.currentText())
+        self.communication.setText(tr(self.controller.communication_state(device)))
+        self.communication.setToolTip(tr("{connection} · {port}\n{protocol} · 地址 {address}",
+                                         connection=device["connection_name"], port=device["port_name"],
+                                         protocol=device["protocol"], address=device["address"]))
         rows = self.controller.latest.get(identifier, [])
         age = time.monotonic() - self.controller.last_received.get(identifier, -1e10)
         stale = age > max(30, 3 * self.controller.timer.interval() / 1000)
@@ -309,35 +313,48 @@ class LivePage(QWidget):
         valid = [r for r in rows if r["status"] == "ok" and not stale and port_connected]
         grain = [r["temp"] for r in valid if r["kind"] == "grain" and r["temp"] is not None]
         ambient = next((r for r in valid if r["kind"] == "ambient"), None)
-        self.metrics[1].setText(f"{len(valid)} / {len(self.controller.point_keys(device))}")
+        self.metrics[0].setText(f"{len(valid)} / {len(self.controller.point_keys(device))}")
         alarm_count = sum(r.get('active', 0) and not r.get('acknowledged_at') for r in self._alarms if r.get('device_id') == identifier)
-        self.metrics[2].setText(f"{alarm_count} 条待处理" if alarm_count else "当前无温度预警")
-        self.metrics[3].setText(f"{number(ambient['temp'])} / {number(ambient['humidity'])}" if ambient else "— / —")
-        self.metrics[4].setText(f"{min(grain):.1f} ～ {max(grain):.1f}℃" if grain else "—")
-        self.metrics[5].setText(number(sum(grain) / len(grain), "℃") if grain else "—")
-        source = "模拟设备" if device["source"] == "simulator" else "现场设备"
-        state = self.controller.communication_state(device)
-        self.note.setText(f"{source} · {device['protocol']} · 地址 {device['address']} · {state}　"
-                          "最近接收时间为电脑时间；立体图为线 / 层布点示意，仓温仓湿独立显示。")
-        self.console_summary.setText(f"{device['connection_name']}\n分机地址 {device['address']}\n"
-                                     f"采集测点 {len(self.controller.point_keys(device))} 个\n{source} · {state}")
+        self.metrics[1].setText(tr("{count} 条", count=alarm_count))
+        alarm_style = "color:#a03e3e;" if alarm_count else ""
+        if self.metrics[1].styleSheet() != alarm_style:
+            self.metrics[1].setStyleSheet(alarm_style)
+        self.metrics[2].setText(f"{number(ambient['temp'], '℃')} / {number(ambient['humidity'], '%RH')}" if ambient else "— / —")
+        self.metrics[3].setText(f"{min(grain):.1f}～{max(grain):.1f}℃ / {sum(grain) / len(grain):.1f}℃" if grain else "— / —")
+        if not rows:
+            self.reading_status.setText(tr("尚无读数"))
+        elif not port_connected:
+            self.reading_status.setText(tr("连接断开 · 仅保留上次读数"))
+        elif stale:
+            self.reading_status.setText(tr("数据已过期 · 仅保留上次读数"))
+        else:
+            self.reading_status.clear()
         display = []
         for row in rows:
-            state = "上次读数 · 连接断开" if not port_connected else "上次读数 · 已过期" if stale else STATUS_NAMES.get(row["status"], row["status"])
-            display.append([f"{'粮温' if row['kind'] == 'grain' else '仓温湿'} {row['point']}",
+            state = "连接断开" if not port_connected else "已过期" if stale else STATUS_NAMES.get(row["status"], row["status"])
+            point_label = tr("粮温 {point}" if row["kind"] == "grain" else "仓温湿 {point}", point=row["point"])
+            display.append([point_label,
                             self._layout_label(identifier, row), number(row["raw_temp"]), number(row["temp"]),
-                            number(row["humidity"]), state, row["timestamp"][11:],
-                            "模拟" if row["source"] == "simulator" else "实机"])
+                            number(row["humidity"]), tr(state), row["timestamp"][11:],
+                            tr("模拟" if row["source"] == "simulator" else "实机")])
         fill_table(self.table, display)
         if stale or not port_connected:
             for r in range(self.table.rowCount()):
                 for c in range(self.table.columnCount()):
                     self.table.item(r, c).setForeground(QColor("#7d8995"))
-                    self.table.item(r, c).setToolTip("这是上次读数，不能代表当前温湿度。")
+                    self.table.item(r, c).setToolTip(tr("这是上次读数，不能代表当前温湿度。"))
         self._display_rows = rows
-        self.silo_view.set_snapshot(build_silo_snapshot(
+        snapshot = build_silo_snapshot(
             device, rows, self.layouts.get(str(identifier), {}),
-            connected=port_connected, stale=stale, alarms=self._alarms))
+            connected=port_connected, stale=stale, alarms=self._alarms)
+        self.silo_view.set_snapshot(snapshot)
+        self.silo_view.layer_combo.setToolTip(snapshot.message)
+        conflicts = sum(not point.registered and bool(point.cable and point.layer)
+                        for layer in snapshot.layers for point in layer.points)
+        message = tr("该分机未配置粮温测点") if not snapshot.grain_count else (
+            tr("{count} 个测点的线 / 层重复", count=conflicts) if conflicts else "")
+        self.silo_view.message_label.setText(message)
+        self.silo_view.message_label.setVisible(bool(message))
         points = sorted((r["point"], r["temp"] if r in valid else math.nan) for r in rows if r["kind"] == "grain")
         if not any(math.isfinite(value) for _, value in points):
             points = []
@@ -346,7 +363,8 @@ class LivePage(QWidget):
             self._clear_matrix()
             for row in rows:
                 is_valid = row in valid
-                cell = QLabel(f"{'粮' if row['kind'] == 'grain' else '仓'} {row['point']:03}\n{number(row['temp'], '℃') if is_valid else '—'}")
+                point_label = tr("粮 {point:03}" if row["kind"] == "grain" else "仓 {point:03}", point=row["point"])
+                cell = QLabel(f"{point_label}\n{number(row['temp'], '℃') if is_valid else '—'}")
                 cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 cell.setFixedSize(64, 44)
                 cell.setToolTip(self._layout_label(identifier, row))
@@ -361,34 +379,33 @@ class LivePage(QWidget):
         if not device:
             return
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"{device['name']} · 测点布置")
+        dialog.setWindowTitle(tr("{device} · 测点布置", device=device["name"]))
         dialog.resize(650, 550)
         layout = QVBoxLayout(dialog)
-        hint = QLabel("线、层相同的粮温点会被视为布点冲突；立体图按这些标签分层展示。仓温仓湿独立显示。")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
         widget = QTableWidget(0, 4)
-        widget.setHorizontalHeaderLabels(["测点", "测温线", "层", "位置名称"])
+        widget.setHorizontalHeaderLabels([tr(title) for title in ("测点", "测温线", "层", "位置名称")])
+        for column in (1, 2):
+            widget.horizontalHeaderItem(column).setToolTip(tr("同一测温线的同一层只能放置一个粮温测点"))
         widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         keys = self.controller.point_keys(device)
         widget.setRowCount(len(keys))
         saved = self.layouts.get(str(identifier), {})
         for i, (kind, point) in enumerate(keys):
             record = saved.get(f"{kind}:{point}", {})
-            item = QTableWidgetItem(f"{'粮温' if kind == 'grain' else '仓温湿'} {point}")
+            item = QTableWidgetItem(tr("粮温 {point}" if kind == "grain" else "仓温湿 {point}", point=point))
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             widget.setItem(i, 0, item)
             for col, key in enumerate(("line", "layer", "position"), 1):
                 widget.setItem(i, col, QTableWidgetItem(str(record.get(key, ""))))
         generate_row = QHBoxLayout()
-        generate_row.addWidget(QLabel("每条测温线层数"))
+        generate_row.addWidget(QLabel(tr("每条测温线层数")))
         layer_count = QSpinBox()
         layer_count.setRange(1, max(1, device["grain_count"]))
         layer_count.setMaximumWidth(90)
         generate_row.addWidget(layer_count)
-        generate = QPushButton("按点号填充线 / 层")
+        generate = QPushButton(tr("按点号填充线 / 层"))
         generate.setEnabled(device["grain_count"] > 0)
-        generate.setToolTip("依次填写第1线各层、第2线各层；只修改当前表格，点击保存后生效。")
+        generate.setToolTip(tr("依次填写第1线各层、第2线各层。保存后更新本地测点视图。"))
 
         def generate_layout():
             for i, (kind, point) in enumerate(keys):
@@ -400,14 +417,8 @@ class LivePage(QWidget):
         generate_row.addWidget(generate)
         generate_row.addStretch()
         layout.addLayout(generate_row)
-        ordering = QLabel("填充顺序：第1线各层 → 第2线各层。请按现场实际层数填写；保存仅影响本地视图。")
-        ordering.setWordWrap(True)
-        ordering.setObjectName("muted")
-        layout.addWidget(ordering)
         layout.addWidget(widget)
         actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        actions.button(QDialogButtonBox.StandardButton.Save).setText("保存")
-        actions.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         actions.accepted.connect(dialog.accept)
         actions.rejected.connect(dialog.reject)
         layout.addWidget(actions)

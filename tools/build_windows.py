@@ -147,6 +147,8 @@ def main():
     }
     (package / "build-info.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     shutil.copy2(ROOT / "release" / "WINDOWS_README.txt", package / "使用说明.txt")
+    manual = (ROOT / "docs" / "上位机使用手册.md").read_text(encoding="utf-8")
+    (package / "上位机使用手册.txt").write_text(manual, encoding="utf-8-sig")
     (package / "Demo.cmd").write_bytes(b'@echo off\r\nstart "" "%~dp0WarehouseTemperatureConsole.exe" --demo\r\n')
     shutil.make_archive(str(archive.with_suffix("")), "zip", root_dir=package.parent, base_dir=package.name)
     with archive.open("rb") as stream:
