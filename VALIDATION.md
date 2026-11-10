@@ -1,5 +1,12 @@
 # 开发与发布验证记录
 
+## 2026-11-10 ROM 基础校验 / 0.1.1
+
+- ROM 不限制家族码；所有入口共用完整 8 字节、Dallas CRC8、非全 00 / 非全 FF 的检查，原有去重与容量约束保留。
+- 两颗现场编码 `2CEE08640200EEC9`、`2CEE49E18AAC1164` 已覆盖扫描分页显示、绑定回读、暂存恢复和 SQLite 配置导入导出；另测旧 28、首字节 00/FF 的有效非均一 ROM、坏 CRC、错长度与错误类型。
+- macOS 全套：`QT_QPA_PLATFORM=offscreen ../.conda/warehouse-pc/bin/python -m pytest -q`，74 项测试及 25 项子检查通过；`git diff --check` 通过。
+- 本次 Windows 构建与最终 EXE 启动结果以本次 Actions 和包内 `build-info.json` 为准。实物登记、温湿度数值仍需甲方现场验证；数据库结构未变。
+
 ## 2026-11-09 Windows x64 便携包
 
 - 构建成功：[GitHub Actions 42601995707](https://github.com/6xj4x7wf5b-ctrl/Test/actions/runs/42601995707)，源码提交 `117e6cb38c724aff422ff53ac13dde8459e642e9`。

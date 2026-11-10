@@ -13,9 +13,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from warehouse_pc import simulator
 from warehouse_pc.protocol import parse_response
 from warehouse_pc.registration import RegistrationDialog, validate_backup
 from warehouse_pc.simulator import ProtocolSimulator
+
+
+FIELD_ROMS = tuple(map(bytes.fromhex, ("2CEE08640200EEC9", "2CEE49E18AAC1164")))
 
 
 class FakeManager(QObject):
@@ -80,9 +84,14 @@ class RegistrationTests(unittest.TestCase):
     def test_initial_full_table_and_complete_scan_pagination(self):
         self.assertEqual(len(self.dialog._cache[1]), 170)
         self.assertFalse(self.dialog.dirty)
-        self.dialog.start_scan()
-        self.wait_idle()
+        field_probes = dict(zip((1001, 1002), FIELD_ROMS))
+        generated_rom = simulator._rom
+        with patch.object(simulator, "_rom", side_effect=lambda serial: field_probes.get(serial) or generated_rom(serial)):
+            self.dialog.start_scan()
+            self.wait_idle()
         self.assertEqual(self.dialog.scan_table.rowCount(), 170)
+        for index, rom in enumerate(FIELD_ROMS):
+            self.assertEqual(self.dialog.scan_table.item(index, 1).text(), rom.hex(" ").upper())
         pages = [request for request in self.manager.requests if request[2] == 2]
         self.assertEqual([int.from_bytes(request[3:5], "big") for request in pages],
                          [0, 27, 54, 81, 108, 135, 162])
@@ -115,7 +124,7 @@ class RegistrationTests(unittest.TestCase):
         self.dialog.table_combo.setCurrentIndex(1)
         self.dialog.read_bindings()
         self.wait_idle()
-        rows = self.dialog._cache[0][:2]
+        rows = [dict(row, rom=rom) for row, rom in zip(self.dialog._cache[0][:2], FIELD_ROMS)]
         document = self.backup_document(rows)
         with tempfile.TemporaryDirectory() as directory:
             filename = Path(directory) / "backup.json"
@@ -126,6 +135,7 @@ class RegistrationTests(unittest.TestCase):
                 self.wait_idle()
         board = self.manager.simulator.board(1)
         self.assertEqual(len(board.staged), 2)
+        self.assertEqual({binding[1] for binding in board.staged.values()}, set(FIELD_ROMS))
         self.assertEqual(len(board.bindings), 170)
         self.assertTrue(self.dialog.dirty)
         self.assertFalse(any(request[2] == 5 for request in self.manager.requests))

@@ -4,6 +4,8 @@ Windows 11 离线串口上位机，使用 Python 3.11、PySide6、PyQtGraph 和 
 
 首版提供仓房/分机管理、多串口采集、探头登记、温湿度微调、超限声音报警、本地历史与备份。登录、园区管理、通风控制、注册码及授权激活未纳入首版。
 
+2026-11-10 / 0.1.1：ROM 校验取消家族码白名单，统一保留 8 字节长度、CRC8、全 00 / 全 FF 检查和重复绑定约束。扫描、登记、备份恢复及数据库入口使用同一规则。配合 V0.3 固件验证现场 2C 探头；数据库结构不变，原有 28 编码继续可用。身份编码通过不代表新探头的温湿度换算已通过实物验证。
+
 ## macOS 启动
 
 已建立项目独立 Conda 环境：
@@ -42,7 +44,7 @@ python -m warehouse_pc --demo --data-dir /path/to/warehouse-data
 本仓库已提供 `.github/workflows/windows-build.yml`，在 GitHub 的 Windows x64 环境构建，Mac 只负责上传源码和下载结果。云端构建需要可用的 GitHub Actions 额度。
 
 1. 将 **`desktop/` 目录的内容作为仓库根目录**提交到自己的 GitHub 私有仓库；根目录应直接看到 `pyproject.toml`、`tools/` 和 `.github/`，不要再套一层 `desktop/`。无需上传分机固件、数据库或 `.conda/`。
-2. 打开仓库的 **Actions → Windows Build → Run workflow**。工作流文件需要先存在于默认分支；该流程仅手动触发。
+2. 打开仓库的 **Actions → Windows Build → Run workflow**。工作流文件需要先存在于默认分支；此外，推送 `build/**` 分支也会自动构建该分支。
 3. 构建成功后，从本次运行的 Artifacts 下载 `windows-x64-release`，解开外层下载包，得到版本 ZIP 和 SHA256 文件。
 4. 将版本 ZIP 完整解压，运行其中的 `WarehouseTemperatureConsole.exe`；`Demo.cmd` 为模拟演示入口。
 
@@ -67,7 +69,7 @@ python tools/build_windows.py
 成功输出：
 
 - `dist/WarehouseTemperatureConsole/WarehouseTemperatureConsole.exe` 及整个同名运行目录。
-- `dist/WarehouseTemperatureConsole-0.1.0-windows-x64.zip` 和对应 `.zip.sha256` 校验文件。
+- `dist/WarehouseTemperatureConsole-0.1.1-windows-x64.zip` 和对应 `.zip.sha256` 校验文件。
 
 交付时需保留整个目录，包括 `_internal/`；这是免安装便携包，不是安装向导。目标为 Windows 11 Intel/AMD x64，串口驱动、声音、缩放和实际设备通信仍需在目标电脑验证。macOS 原生 Python 不能用此流程生成 Windows EXE，脚本会直接提示改用 Windows 或云端构建。
 

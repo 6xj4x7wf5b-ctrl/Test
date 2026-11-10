@@ -176,6 +176,9 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.store.get_binding_version(self.device), 2)
         with self.assertRaises(ValueError):
             rom_hex("2800000000000001")
+        for value in (0, object(), "00" * 8, "FF" * 8, "2C", "2CEE08640200EEC8"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                rom_hex(value)
 
     def test_backup_is_consistent_and_reopens(self):
         self.store.save_samples(self.device, [self.grain()])
@@ -198,7 +201,11 @@ class StorageTests(unittest.TestCase):
     def test_config_roundtrip_and_atomic_failure(self):
         self.store.save_calibration(self.device, "grain", 1, 1)
         self.store.save_threshold(self.device, "grain", temp_high=30)
-        self.store.set_bindings(self.device, [{"kind": "grain", "point": 1, "rom": valid_rom()}])
+        field_roms = ("2CEE08640200EEC9", "2CEE49E18AAC1164")
+        self.store.set_bindings(self.device, [
+            {"kind": "grain", "point": 1, "rom": "2C-EE-08-64-02-00-EE-C9"},
+            {"kind": "ambient", "point": 1, "rom": bytes.fromhex(field_roms[1])},
+        ])
         self.store.set_setting("history_interval", 30)
         self.store.save_samples(self.device, [self.grain()])
         exported = self.store.export_config()
@@ -221,6 +228,7 @@ class StorageTests(unittest.TestCase):
         try:
             imported.import_config(exported)
             self.assertEqual(len(imported.devices()), 1)
+            self.assertEqual({row["rom"] for row in imported.bindings(imported.devices()[0]["id"])}, set(field_roms))
             self.assertEqual(imported.history_count(), 0)
             self.assertEqual(imported.calibrations(imported.devices()[0]["id"])[0]["temp_offset"], 1)
         finally:

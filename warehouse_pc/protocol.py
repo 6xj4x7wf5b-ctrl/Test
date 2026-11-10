@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .domain import crc8 as crc8, rom_bytes
+
 GRAIN_CAPACITY = 165
 AMBIENT_CAPACITY = 5
 AMBIENT_BASE = 0x2000
@@ -62,15 +64,6 @@ def crc16(data: bytes) -> int:
     return crc
 
 
-def crc8(data: bytes) -> int:
-    crc = 0
-    for value in data:
-        crc ^= value
-        for _ in range(8):
-            crc = (crc >> 1) ^ (0x8C if crc & 1 else 0)
-    return crc
-
-
 def with_crc(data: bytes) -> bytes:
     return bytes(data) + crc16(data).to_bytes(2, "little")
 
@@ -100,12 +93,21 @@ def build_modbus_read(address: int, start: int, count: int) -> bytes:
     return with_crc(bytes((address, 3)) + start.to_bytes(2, "big") + count.to_bytes(2, "big"))
 
 
+def _maintenance_rom(data: bytes) -> bytes:
+    try:
+        return rom_bytes(data)
+    except ValueError as exc:
+        raise ProtocolError(str(exc)) from exc
+
+
 def build_maintenance(address: int, op: int, payload: bytes = b"") -> bytes:
     _integer(address, 1, 247, "维护地址")
     _integer(op, 0, 255, "维护操作码")
     payload = bytes(payload)
     if len(payload) > 251:
         raise ProtocolError("维护参数过长")
+    if op == 3:
+        _maintenance_rom(payload[4:])
     return with_crc(bytes((address, 0x41, op)) + payload)
 
 
@@ -306,16 +308,15 @@ def parse_maintenance(frame: bytes, **context: Any) -> dict[str, Any]:
             raise ProtocolError("扫描分页超过总数")
         records = []
         for index in range(data[4]):
-            bus, rom = data[5 + index * 9], data[6 + index * 9:14 + index * 9]
-            if rom[0] != 0x28 or crc8(rom[:7]) != rom[7]:
-                raise ProtocolError("扫描结果ROM校验失败")
+            bus = data[5 + index * 9]
+            rom = _maintenance_rom(data[6 + index * 9:14 + index * 9])
             records.append({"bus": bus, "rom": rom, "rom_hex": rom.hex().upper()})
         result.update(total=total, offset=offset, records=records)
     elif op == 7:
         kind = {1: "grain", 2: "ambient"}.get(data[0])
-        rom = data[5:13]
-        if kind is None or data[3] > 1 or rom[0] != 0x28 or crc8(rom[:7]) != rom[7]:
-            raise ProtocolError("绑定响应类型、表或ROM无效")
+        if kind is None or data[3] > 1:
+            raise ProtocolError("绑定响应类型或表无效")
+        rom = _maintenance_rom(data[5:13])
         result["binding"] = {"kind": kind, "point": _word(data, 1), "table": data[3],
                                "bus": data[4], "rom": rom, "rom_hex": rom.hex().upper()}
     elif op == 8:

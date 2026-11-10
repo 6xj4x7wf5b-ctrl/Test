@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from .domain import rom_bytes
 from .protocol import build_maintenance
 
 
@@ -36,25 +37,6 @@ MAX_BINDINGS = 4096
 def _integer(value: Any, name: str, lower: int, upper: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
         raise ValueError(f"{name}必须在 {lower}～{upper} 范围内")
-    return value
-
-
-def rom_bytes(value: Any) -> bytes:
-    """Validate complete ROM including its reflected Dallas CRC8."""
-    if isinstance(value, str):
-        try:
-            value = bytes.fromhex(value)
-        except ValueError as exc:
-            raise ValueError("ROM 编码必须是 16 位十六进制字符") from exc
-    if not isinstance(value, bytes) or len(value) != 8 or value[0] != 0x28:
-        raise ValueError("ROM 必须是系列码 28 开头的完整 8 字节编码")
-    crc = 0
-    for byte in value[:7]:
-        crc ^= byte
-        for _ in range(8):
-            crc = (crc >> 1) ^ (0x8C if crc & 1 else 0)
-    if crc != value[7]:
-        raise ValueError("ROM 的 CRC8 校验不通过")
     return value
 
 

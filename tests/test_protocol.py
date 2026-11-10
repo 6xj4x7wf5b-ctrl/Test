@@ -152,6 +152,39 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             parse_maintenance(frame)
 
+    def test_maintenance_roundtrips_roms_without_family_list(self):
+        field_roms = tuple(map(bytes.fromhex, ("2CEE08640200EEC9", "2CEE49E18AAC1164")))
+        old_rom = self.maint(7, bytes((1, 0, 1, 0)))["binding"]["rom"]
+        other_roms = []
+        for first_byte in (0x00, 0xFF):
+            body = bytes((first_byte, 0xA5)) + bytes(5)
+            other_roms.append(body + bytes((crc8(body),)))
+        roms = (*field_roms, old_rom, *other_roms)
+        scan = with_crc(b"\x01\x41\x02\x00" + struct.pack(">HHB", len(roms), 0, len(roms))
+                        + b"".join(b"\0" + rom for rom in roms))
+        self.assertEqual([record["rom"] for record in parse_maintenance(scan)["records"]], list(roms))
+
+        for point, rom in enumerate((*field_roms, *other_roms), start=2):
+            self.assertEqual(self.maint(3, bytes((1, 0, point, 0)) + rom)["result"], 0)
+        self.assertEqual(self.maint(3, bytes((1, 0, 7, 0)) + field_roms[0])["result"], 3)
+        self.assertEqual(self.maint(5)["result"], 0)
+        for point, rom in enumerate((old_rom, *field_roms, *other_roms), start=1):
+            self.assertEqual(self.maint(7, bytes((1, 0, point, 0)))["binding"]["rom"], rom)
+
+    def test_maintenance_rejects_invalid_roms_in_requests_and_responses(self):
+        key_and_bus = bytes((1, 0, 1, 0))
+        for rom in (bytes(8), b"\xff" * 8, bytes.fromhex("2CEE08640200EEC8"), bytes(7)):
+            with self.subTest(rom=rom.hex()):
+                with self.assertRaises(ProtocolError):
+                    build_maintenance(1, 3, key_and_bus + rom)
+                raw_request = with_crc(b"\x01\x41\x03" + key_and_bus + rom)
+                self.assertEqual(parse_maintenance(self.simulator.simulate_request(raw_request))["result"], 2)
+                scan = with_crc(b"\x01\x41\x02\x00\x00\x01\x00\x00\x01\x00" + rom)
+                binding = with_crc(b"\x01\x41\x07\x00" + key_and_bus + b"\x00" + rom)
+                for response in (scan, binding):
+                    with self.assertRaises(ProtocolError):
+                        parse_maintenance(response)
+
     def test_staged_save_discard_duplicate_and_timestamp(self):
         initial = self.maint(0)["info"]
         key = bytes((1, 0, 12))

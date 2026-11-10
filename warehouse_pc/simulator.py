@@ -10,9 +10,10 @@ import math
 import time
 from typing import Any, Callable
 
+from .domain import crc8, rom_bytes
 from .protocol import (
     AMBIENT_BASE, AMBIENT_CAPACITY, GRAIN_CAPACITY, STATUS_BASE,
-    ProtocolError, crc8, crc16, encode_humidity, encode_temperature, with_crc,
+    ProtocolError, crc16, encode_humidity, encode_temperature, with_crc,
 )
 
 
@@ -203,8 +204,9 @@ class ProtocolSimulator:
             key = self._kind_point(payload)
             if key is None or payload[3] != 0:
                 return 1, b""
-            rom = payload[4:12]
-            if rom[0] != 0x28 or crc8(rom[:7]) != rom[7]:
+            try:
+                rom = rom_bytes(payload[4:12])
+            except ValueError:
                 return 2, b""
             if any(old_key != key and binding[1] == rom for old_key, binding in board.staged.items()):
                 return 3, b""

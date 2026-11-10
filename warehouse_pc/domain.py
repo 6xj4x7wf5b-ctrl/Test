@@ -95,27 +95,38 @@ def normalize_source(source: str) -> str:
     return value
 
 
-def rom_hex(value: object) -> str:
-    try:
-        if isinstance(value, (bytes, bytearray)):
-            data = bytes(value)
-        else:
-            data = bytes.fromhex(str(value).replace("-", "").replace(":", "").replace(" ", ""))
-    except (ValueError, TypeError) as exc:
-        raise ValueError("传感器编码必须是完整的8字节ROM") from exc
-    if len(data) != 8 or data[0] != 0x28:
-        raise ValueError("传感器ROM应为8字节且系列码为28")
+def crc8(data: bytes) -> int:
+    """Return the reflected Dallas/Maxim CRC8 used in probe ROMs."""
     crc = 0
-    for byte in data[:7]:
+    for value in data:
+        crc ^= value
         for _ in range(8):
-            mix = (crc ^ byte) & 1
-            crc >>= 1
-            if mix:
-                crc ^= 0x8C
-            byte >>= 1
-    if crc != data[7]:
-        raise ValueError("传感器ROM校验失败")
-    return data.hex().upper()
+            crc = (crc >> 1) ^ (0x8C if crc & 1 else 0)
+    return crc
+
+
+def rom_bytes(value: object) -> bytes:
+    """Validate and normalize a complete probe ROM in wire byte order."""
+    if isinstance(value, str):
+        try:
+            data = bytes.fromhex(value.replace("-", "").replace(":", "").replace(" ", ""))
+        except ValueError as exc:
+            raise ValueError("ROM 编码必须是 16 位十六进制字符") from exc
+    elif isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+    else:
+        raise ValueError("ROM 编码必须是字节或十六进制文本")
+    if len(data) != 8:
+        raise ValueError("ROM 必须是完整的 8 字节编码")
+    if data in (b"\x00" * 8, b"\xff" * 8):
+        raise ValueError("ROM 不能为全 00 或全 FF")
+    if crc8(data[:7]) != data[7]:
+        raise ValueError("ROM 的 CRC8 校验不通过")
+    return data
+
+
+def rom_hex(value: object) -> str:
+    return rom_bytes(value).hex().upper()
 
 
 def _spreadsheet_value(value: object) -> object:
