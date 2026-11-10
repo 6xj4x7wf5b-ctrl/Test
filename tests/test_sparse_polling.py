@@ -1,5 +1,8 @@
 """Sparse registered points use exact on-wire IDs and keep polling scoped."""
+import time
+
 import pytest
+from PySide6.QtTest import QTest
 from PySide6.QtCore import QObject, Signal
 
 from warehouse_pc.controller import Controller
@@ -99,18 +102,25 @@ def test_manual_poll_submits_only_selected_device_and_stores_only_registered_row
     }
 
 
-def test_reconnect_requires_fresh_response_even_if_previous_ping_was_in_flight(controller, qtbot):
+def test_reconnect_requires_fresh_response_even_if_previous_ping_was_in_flight(controller, qt_application):
+    def wait_until(predicate):
+        deadline = time.monotonic() + 5
+        while not predicate() and time.monotonic() < deadline:
+            qt_application.processEvents()
+            QTest.qWait(5)
+        assert predicate()
+
     device = controller.device(7)
     controller.query_online(device)
-    qtbot.waitUntil(lambda: controller.communication_state(device) == "分机已响应")
-    qtbot.waitUntil(lambda: not controller.manager.busy("3"))
+    wait_until(lambda: controller.communication_state(device) == "分机已响应")
+    wait_until(lambda: not controller.manager.busy("3"))
     controller.query_online(device)
     assert controller.manager.pending_count("3") == 1
     controller.manager.disconnect_port("3")
     assert controller.communication_state(device) == "串口未打开"
     controller.connect_all()
     assert controller.communication_state(device) == "串口已打开 · 待查询"
-    qtbot.wait(70)
+    QTest.qWait(70)
     assert controller.communication_state(device) == "串口已打开 · 待查询"
     controller.query_online(device)
-    qtbot.waitUntil(lambda: controller.communication_state(device) == "分机已响应")
+    wait_until(lambda: controller.communication_state(device) == "分机已响应")
