@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
+from .domain import configured_point_keys
 
 
 class WarehousePage(QWidget):
@@ -130,8 +131,8 @@ class WarehousePage(QWidget):
                 continue
             devices = [row for row in metadata["devices"] if row["warehouse_id"] == warehouse["id"]]
             self._rows.append({**warehouse, "device_count": len(devices),
-                               "grain": sum(row["grain_count"] for row in devices),
-                               "ambient": sum(row["ambient_count"] for row in devices)})
+                               "grain": sum(sum(k == "grain" for k, p in configured_point_keys(row)) for row in devices),
+                               "ambient": sum(sum(k == "ambient" for k, p in configured_point_keys(row)) for row in devices)})
         self.table.setRowCount(len(self._rows))
         for index, row in enumerate(self._rows):
             for column, value in enumerate((row["name"], row["device_count"], row["grain"], row["ambient"], "已关联设备" if row["device_count"] else "空仓房档案")):

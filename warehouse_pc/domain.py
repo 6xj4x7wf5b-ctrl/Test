@@ -164,3 +164,13 @@ def export_excel(destination: str | Path, rows: Iterable[Mapping], columns: Sequ
         sheet.append([_spreadsheet_value(row.get(field)) for field in fields])
     book.save(path)
     return path
+
+
+def configured_point_keys(device):
+    """Current sampling scope; verified registration never invents intermediate IDs."""
+    if device.get("bindings_verified"):
+        return sorted({(r["kind"], r["point"]) for r in device.get("registered_points") or []})
+    if device.get("registration_required"):
+        return []
+    return [(kind, point) for kind, count in (("grain", device.get("grain_count", 0)), ("ambient", device.get("ambient_count", 0)))
+            for point in range(1, count + 1)]

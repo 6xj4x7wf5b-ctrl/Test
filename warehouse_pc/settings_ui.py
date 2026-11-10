@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
@@ -19,7 +19,17 @@ class SettingsPage(QWidget):
         self.repo, self.controller = repository, controller
         self.sound_enabled = True
         self._devices, self._calibrations, self._thresholds, self._alarms = {}, {}, {}, []
-        self._request_generation = 0
+        self._active_device = None
+        self._calibration_point = ("grain", 1)
+        self._threshold_type = "grain"
+        self._calibration_baseline = (0.0, 0.0)
+        self._threshold_baseline = {}
+        self._request_generation = {"calibrations": 0, "thresholds": 0}
+        self._loaded = {"calibrations": False, "thresholds": False}
+        self._loading = set()
+        self._saving = None
+        self._interval_baseline = None
+        self._collection_busy = self._sound_busy = self._sound_ready = False
         self._build_ui()
         controller.metadata_changed.connect(self._metadata_changed)
         controller.alarms_changed.connect(self._alarms_changed)
@@ -34,15 +44,20 @@ class SettingsPage(QWidget):
         title.setObjectName("pageTitle")
         layout.addWidget(title)
         device_row = QHBoxLayout()
-        device_row.addWidget(QLabel("当前设备"))
+        device_label = QLabel("微调与阈值适用设备")
+        device_row.addWidget(device_label)
         self.device_combo = QComboBox()
         self.device_combo.setMinimumWidth(240)
         self.device_combo.setMaximumWidth(420)
         self.device_combo.currentIndexChanged.connect(self._device_changed)
         device_row.addWidget(self.device_combo)
+        self.retry_device_button = QPushButton("重新读取参数")
+        self.retry_device_button.clicked.connect(self._reload_device_parameters)
+        device_row.addWidget(self.retry_device_button)
         device_row.addStretch()
         layout.addLayout(device_row)
         tabs = QTabWidget()
+        self._tabs = tabs
         layout.addWidget(tabs, 1)
         self.message = QLabel("所有修正仅用于后续采集，历史记录保留采集时的原值与修正值。")
         self.message.setWordWrap(True)
@@ -50,7 +65,7 @@ class SettingsPage(QWidget):
 
         collection = QWidget()
         collection_layout = QVBoxLayout(collection)
-        group = QGroupBox("采集与历史")
+        group = QGroupBox("采集与历史 · 适用于全部分机")
         form = QFormLayout(group)
         self.poll_seconds = QSpinBox()
         self.poll_seconds.setRange(1, 86_400)
@@ -64,7 +79,7 @@ class SettingsPage(QWidget):
         self.history_seconds.setMaximumWidth(170)
         form.addRow("实时采集周期", self.poll_seconds)
         form.addRow("历史保存间隔", self.history_seconds)
-        intervals = QPushButton("应用采集与保存周期")
+        self.intervals_button = intervals = QPushButton("应用采集与保存周期")
         intervals.setMaximumWidth(180)
         intervals.clicked.connect(self._save_intervals)
         form.addRow(intervals)
@@ -86,9 +101,8 @@ class SettingsPage(QWidget):
         self.kind_combo.addItem("粮温测点", "grain")
         self.kind_combo.addItem("仓温仓湿", "ambient")
         self.kind_combo.currentIndexChanged.connect(self._kind_changed)
-        self.point_spin = QSpinBox()
-        self.point_spin.setRange(1, 165)
-        self.point_spin.valueChanged.connect(self._fill_calibration)
+        self.point_combo = QComboBox()
+        self.point_combo.currentIndexChanged.connect(self._kind_changed)
         self.temp_offset = QDoubleSpinBox()
         self.temp_offset.setRange(-50, 50)
         self.temp_offset.setDecimals(2)
@@ -99,12 +113,12 @@ class SettingsPage(QWidget):
         self.humidity_offset.setDecimals(2)
         self.humidity_offset.setSingleStep(0.1)
         self.humidity_offset.setSuffix(" %RH")
-        for widget in (self.kind_combo, self.point_spin, self.temp_offset, self.humidity_offset):
+        for widget in (self.kind_combo, self.point_combo, self.temp_offset, self.humidity_offset):
             widget.setMaximumWidth(190)
         self.batch_box = QCheckBox("应用到当前设备的同类全部测点")
-        self.batch_box.toggled.connect(lambda checked: self.point_spin.setEnabled(not checked and bool(self.device_combo.currentData())))
+        self.batch_box.toggled.connect(self._update_enabled)
         cal_form.addRow("测点类型", self.kind_combo)
-        cal_form.addRow("测点编号", self.point_spin)
+        cal_form.addRow("测点编号", self.point_combo)
         cal_form.addRow("温度加减修正", self.temp_offset)
         cal_form.addRow("湿度加减修正", self.humidity_offset)
         cal_form.addRow(self.batch_box)
@@ -128,7 +142,7 @@ class SettingsPage(QWidget):
         self.threshold_kind = QComboBox()
         self.threshold_kind.addItem("粮温测点", "grain")
         self.threshold_kind.addItem("仓温仓湿", "ambient")
-        self.threshold_kind.currentIndexChanged.connect(self._fill_thresholds)
+        self.threshold_kind.currentIndexChanged.connect(self._threshold_changed)
         self.threshold_kind.setMaximumWidth(190)
         threshold_form.addRow("适用类型", self.threshold_kind)
         self.threshold_inputs = {}
@@ -164,148 +178,339 @@ class SettingsPage(QWidget):
         self.alarm_table.horizontalHeader().setStretchLastSection(True)
         alarms_layout.addWidget(self.alarm_table, 1)
         tabs.addTab(alarms, "阈值与报警")
+        for widget in (device_label, self.device_combo, self.retry_device_button):
+            tabs.currentChanged.connect(lambda index, field=widget: field.setVisible(index != 0))
+            widget.hide()
+        self._update_enabled()
 
     def reload_settings(self):
-        self.repo.call("get_setting", "sound_enabled", True, callback=self._sound_loaded, on_error=self._error)
-        self.repo.call("get_setting", "collection", {}, callback=self._intervals_loaded, on_error=self._error)
-        self._device_changed()
+        self._load_globals()
+        if not self._saving and not self._loading and not self._device_dirty():
+            self._load_parameters()
         self.controller.refresh_alarms()
 
     refresh = reload_settings
 
-    def _sound_loaded(self, value):
-        self.sound_enabled = value if isinstance(value, bool) else True
-        self.sound_box.blockSignals(True)
-        self.sound_box.setChecked(self.sound_enabled)
-        self.sound_box.blockSignals(False)
-        self.sound_changed.emit(self.sound_enabled)
+    def _load_globals(self):
+        if not self._collection_busy and not self._intervals_dirty():
+            self._collection_busy = True
+            self._interval_baseline = None
+            self.repo.call("get_setting", "collection", {}, callback=self._intervals_loaded,
+                           on_error=self._intervals_failed)
+        if not self._sound_busy:
+            self._sound_busy = True
+            self._sound_ready = False
+            self.repo.call("get_setting", "sound_enabled", True, callback=self._sound_loaded,
+                           on_error=self._sound_failed)
+        self._update_enabled()
+
+    def _interval_values(self):
+        return self.poll_seconds.value(), self.history_seconds.value()
+
+    def _intervals_dirty(self):
+        return self._interval_baseline is not None and self._interval_values() != self._interval_baseline
 
     def _intervals_loaded(self, value):
         if not isinstance(value, dict):
+            self._intervals_failed("全局采集设置格式无效")
             return
-        try:
-            self.poll_seconds.setValue(int(value.get("poll_seconds", 5)))
-            self.history_seconds.setValue(int(value.get("history_seconds", 30)))
-            self.controller.set_intervals(self.poll_seconds.value(), self.history_seconds.value())
-        except (TypeError, ValueError):
-            self.message.setText("保存的采集周期无效，请重新设置。")
+        poll, history = value.get("poll_seconds", 5), value.get("history_seconds", 30)
+        if (type(poll) is not int or not 1 <= poll <= self.poll_seconds.maximum()
+                or type(history) is not int or not 1 <= history <= self.history_seconds.maximum()):
+            self._intervals_failed("全局采集设置超出允许范围")
+            return
+        self._collection_busy = False
+        self.poll_seconds.setValue(poll)
+        self.history_seconds.setValue(history)
+        self._interval_baseline = (poll, history)
+        self._update_enabled()
+
+    def _intervals_failed(self, message):
+        self._collection_busy = False
+        self._update_enabled()
+        self._error(message)
 
     def _save_intervals(self):
-        self.controller.set_intervals(self.poll_seconds.value(), self.history_seconds.value())
-        self.message.setText("采集与历史保存周期已应用；已有历史记录保留。")
+        if self._interval_baseline is None or self._collection_busy:
+            return
+        poll, history = self._interval_values()
+        self._collection_busy = True
+        self._update_enabled()
+
+        def saved(_):
+            self._collection_busy = False
+            self._interval_baseline = (poll, history)
+            self.controller.set_intervals(poll, history, persist=False)
+            self._update_enabled()
+            self.message.setText("所有分机的采集与保存周期已应用，已有历史记录保留。")
+
+        self.repo.call("set_setting", "collection", {"poll_seconds": poll, "history_seconds": history},
+                       callback=saved, on_error=self._intervals_failed)
+
+    def _sound_loaded(self, value):
+        if not isinstance(value, bool):
+            self._sound_failed("报警声音设置格式无效")
+            return
+        self._sound_busy = False
+        self._sound_ready = True
+        self.sound_enabled = value
+        with QSignalBlocker(self.sound_box):
+            self.sound_box.setChecked(value)
+        self.sound_changed.emit(value)
+        self._update_enabled()
+
+    def _sound_failed(self, message):
+        self._sound_busy = False
+        with QSignalBlocker(self.sound_box):
+            self.sound_box.setChecked(self.sound_enabled)
+        self._update_enabled()
+        self._error(message)
 
     def _save_sound(self, checked):
+        if not self._sound_ready or self._sound_busy:
+            return
+        self._sound_busy = True
+        self._update_enabled()
+
         def saved(_):
-            self.sound_enabled = checked
-            self.sound_changed.emit(checked)
+            self._sound_loaded(bool(checked))
             self.message.setText("报警声音已开启。" if checked else "报警声音已关闭，报警记录继续保存。")
-        def failed(message):
-            self.sound_box.blockSignals(True)
-            self.sound_box.setChecked(self.sound_enabled)
-            self.sound_box.blockSignals(False)
-            self._error(message)
-        self.repo.call("set_setting", "sound_enabled", bool(checked), callback=saved, on_error=failed)
+
+        self.repo.call("set_setting", "sound_enabled", bool(checked), callback=saved, on_error=self._sound_failed)
 
     def _metadata_changed(self, metadata):
-        previous = self.device_combo.currentData()
-        self._devices = {device["id"]: device for device in metadata.get("devices", [])}
-        self.device_combo.blockSignals(True)
-        self.device_combo.clear()
-        for device in self._devices.values():
-            source = "模拟" if device.get("source") == "simulator" else "串口"
-            self.device_combo.addItem(f"{device.get('warehouse_name', '')} / {device['name']}（{source}）", device["id"])
-        index = self.device_combo.findData(previous)
-        if index >= 0:
-            self.device_combo.setCurrentIndex(index)
-        self.device_combo.blockSignals(False)
-        self._device_changed()
+        previous = self._active_device
+        self._devices = {device["id"]: dict(device) for device in metadata.get("devices", [])}
+        with QSignalBlocker(self.device_combo):
+            self.device_combo.clear()
+            for device in self._devices.values():
+                source = "模拟" if device.get("source") == "simulator" else "串口"
+                self.device_combo.addItem(f"{device.get('warehouse_name', '')} / {device['name']}（{source}）", device["id"])
+            index = self.device_combo.findData(previous)
+            self.device_combo.setCurrentIndex(max(0, index))
+        if previous != self.device_combo.currentData():
+            self._select_device(self.device_combo.currentData())
+        elif not self._device_dirty() and not self._saving:
+            self._sync_device_selectors()
+            if self._loaded["calibrations"]:
+                self._fill_calibration()
+            if self._loaded["thresholds"]:
+                self._fill_thresholds()
+        self._update_enabled()
 
     def _device_changed(self, *_):
-        self._request_generation += 1
-        request = self._request_generation
         identifier = self.device_combo.currentData()
-        self._calibrations, self._thresholds = {}, {}
-        enabled = identifier is not None
-        for widget in (self.kind_combo, self.threshold_kind, self.temp_offset, self.batch_box,
-                       self.save_calibration_button, self.save_threshold_button):
-            widget.setEnabled(enabled)
-        self._kind_changed()
-        self._fill_thresholds()
-        if not enabled:
-            self.calibration_version.setText("请先创建仓房、连接和设备。")
+        if identifier == self._active_device:
             return
-        device = self._devices[identifier]
-        self.calibration_version.setText(f"设备当前修正版本：{device.get('calibration_version', 0)}")
-        def calibrations(rows):
-            if request == self._request_generation:
+        if self._saving or (self._device_dirty() and not self._confirm_discard()):
+            with QSignalBlocker(self.device_combo):
+                self.device_combo.setCurrentIndex(self.device_combo.findData(self._active_device))
+            return
+        self._select_device(identifier)
+
+    def _select_device(self, identifier):
+        self._active_device = identifier
+        self._calibrations, self._thresholds = {}, {}
+        self._loaded = dict.fromkeys(self._loaded, False)
+        self._sync_device_selectors()
+        self._load_parameters()
+
+    def _points(self, kind):
+        device = self._devices.get(self._active_device)
+        return [point for key, point in self.controller.point_keys(device) if key == kind] if device else []
+
+    def _sync_device_selectors(self, point=None):
+        available = {kind: self._points(kind) for kind in ("grain", "ambient")}
+        for combo in (self.kind_combo, self.threshold_kind):
+            with QSignalBlocker(combo):
+                for index, kind in enumerate(("grain", "ambient")):
+                    combo.model().item(index).setEnabled(bool(available[kind]))
+                if any(available.values()) and not available[combo.currentData()]:
+                    combo.setCurrentIndex(1 - combo.currentIndex())
+        previous = self.point_combo.currentData() if point is None else point
+        with QSignalBlocker(self.point_combo):
+            self.point_combo.clear()
+            for point in available[self.kind_combo.currentData()]:
+                self.point_combo.addItem(str(point), point)
+            self.point_combo.setCurrentIndex(max(0, self.point_combo.findData(previous)))
+
+    def _update_enabled(self, *_):
+        self.device_combo.setEnabled(bool(self._devices) and not self._saving)
+        self.retry_device_button.setEnabled(self._active_device is not None and not self._saving)
+        calibration = self._loaded["calibrations"] and not self._saving and self.point_combo.count() > 0
+        threshold = self._loaded["thresholds"] and not self._saving and self._points(self.threshold_kind.currentData())
+        for widget in (self.kind_combo, self.temp_offset, self.batch_box, self.save_calibration_button):
+            widget.setEnabled(bool(calibration))
+        self.point_combo.setEnabled(bool(calibration and not self.batch_box.isChecked()))
+        self.humidity_offset.setEnabled(bool(calibration and self.kind_combo.currentData() == "ambient"))
+        self.threshold_kind.setEnabled(bool(threshold))
+        self.save_threshold_button.setEnabled(bool(threshold))
+        for field, editor in self.threshold_inputs.items():
+            editor.setEnabled(bool(threshold and (not field.startswith("humidity") or self.threshold_kind.currentData() == "ambient")))
+        global_ready = self._interval_baseline is not None and not self._collection_busy
+        for widget in (self.poll_seconds, self.history_seconds, self.intervals_button):
+            widget.setEnabled(global_ready)
+        self.sound_box.setEnabled(self._sound_ready and not self._sound_busy)
+
+    def _load_parameters(self, section=None):
+        identifier = self._active_device
+        sections = (section,) if section else ("calibrations", "thresholds")
+        if identifier is None:
+            self._loading.clear()
+            for key in sections:
+                self._request_generation[key] += 1
+                self._loaded[key] = False
+            self.calibration_version.setText("请先创建仓房、连接和设备。")
+            self._fill_calibration()
+            self._fill_thresholds()
+            self._update_enabled()
+            return
+        for key in sections:
+            self._load_section(identifier, key)
+
+    def _load_section(self, identifier, section):
+        self._request_generation[section] += 1
+        request = self._request_generation[section]
+        self._loaded[section] = False
+        self._loading.add(section)
+        self._update_enabled()
+        if section == "calibrations":
+            self.calibration_version.setText("正在读取微调参数…")
+
+        def current():
+            return identifier == self._active_device and request == self._request_generation[section]
+
+        def loaded(rows):
+            if not current():
+                return
+            self._loading.discard(section)
+            self._loaded[section] = True
+            if section == "calibrations":
                 self._calibrations = {(row["kind"], row["point"]): row for row in rows}
+                version = self._devices[identifier].get("calibration_version", 0)
+                self.calibration_version.setText(f"设备当前修正版本：{version}")
                 self._fill_calibration()
-        def thresholds(rows):
-            if request == self._request_generation:
+            else:
                 self._thresholds = {row["kind"]: row for row in rows}
                 self._fill_thresholds()
+            self._update_enabled()
+
         def failed(message):
-            if request == self._request_generation:
-                self._error(message)
-        self.repo.call("calibrations", identifier, callback=calibrations, on_error=failed)
-        self.repo.call("thresholds", identifier, callback=thresholds, on_error=failed)
+            if not current():
+                return
+            self._loading.discard(section)
+            if section == "calibrations":
+                self.calibration_version.setText("微调参数未加载")
+            self._error(message)
+
+        self.repo.call(section, identifier, callback=loaded, on_error=failed)
+
+    def _calibration_values(self):
+        return self.temp_offset.value(), self.humidity_offset.value()
+
+    def _calibration_dirty(self):
+        return self._loaded["calibrations"] and (
+            self.batch_box.isChecked() or self._calibration_values() != self._calibration_baseline)
+
+    def _threshold_text(self):
+        return {field: editor.text().strip() for field, editor in self.threshold_inputs.items()}
+
+    def _threshold_dirty(self):
+        return self._loaded["thresholds"] and self._threshold_text() != self._threshold_baseline
+
+    def _device_dirty(self):
+        return self._calibration_dirty() or self._threshold_dirty()
+
+    def _confirm_discard(self):
+        return QMessageBox.question(
+            self, "未保存的设备参数", "放弃当前未保存的参数修改？",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel) == QMessageBox.StandardButton.Discard
+
+    def _reload_device_parameters(self):
+        if not self._saving and (not self._device_dirty() or self._confirm_discard()):
+            self._load_parameters()
 
     def _kind_changed(self, *_):
-        device = self._devices.get(self.device_combo.currentData())
-        if device is None:
-            self.point_spin.setEnabled(False)
-            self.humidity_offset.setEnabled(False)
+        if not self._loaded["calibrations"]:
             return
-        for combo in (self.kind_combo, self.threshold_kind):
-            for index, field in ((0, "grain_count"), (1, "ambient_count")):
-                combo.model().item(index).setEnabled(device[field] > 0)
-            field = "grain_count" if combo.currentData() == "grain" else "ambient_count"
-            if device[field] == 0:
-                combo.setCurrentIndex(1 - combo.currentIndex())
-        kind = self.kind_combo.currentData()
-        self.point_spin.setMaximum(device["grain_count" if kind == "grain" else "ambient_count"])
-        self.point_spin.setEnabled(not self.batch_box.isChecked())
-        self.humidity_offset.setEnabled(kind == "ambient")
+        if self._calibration_dirty() and not self._confirm_discard():
+            kind, point = self._calibration_point
+            with QSignalBlocker(self.kind_combo):
+                self.kind_combo.setCurrentIndex(self.kind_combo.findData(kind))
+            self._sync_device_selectors(point)
+            return
+        self._sync_device_selectors()
         self._fill_calibration()
+        self._update_enabled()
 
-    def _fill_calibration(self, *_):
-        row = self._calibrations.get((self.kind_combo.currentData(), self.point_spin.value()), {})
+    def _fill_calibration(self):
+        kind = self.kind_combo.currentData()
+        self._calibration_point = kind, self.point_combo.currentData()
+        row = self._calibrations.get(self._calibration_point, {})
         self.temp_offset.setValue(row.get("temp_offset", 0))
-        self.humidity_offset.setValue(row.get("humidity_offset", 0) if self.kind_combo.currentData() == "ambient" else 0)
+        self.humidity_offset.setValue(row.get("humidity_offset", 0) if kind == "ambient" else 0)
+        with QSignalBlocker(self.batch_box):
+            self.batch_box.setChecked(False)
+        self._calibration_baseline = self._calibration_values()
 
     def _save_calibration(self):
-        identifier = self.device_combo.currentData()
-        device = self._devices.get(identifier)
-        if device is None:
+        if not self._loaded["calibrations"] or self._saving:
             return
-        kind = self.kind_combo.currentData()
-        points = range(1, device["grain_count" if kind == "grain" else "ambient_count"] + 1) if self.batch_box.isChecked() else [self.point_spin.value()]
-        rows = [dict(kind=kind, point=point, temp_offset=self.temp_offset.value(),
-                     humidity_offset=self.humidity_offset.value() if kind == "ambient" else 0) for point in points]
-        self.save_calibration_button.setEnabled(False)
-        def saved(version):
-            self.save_calibration_button.setEnabled(True)
-            self.message.setText(f"微调参数已保存，共{len(rows)}个测点。仅后续采集生效，历史保持原值。")
-            if identifier in self._devices:
-                self._devices[identifier]["calibration_version"] = version
-            self._device_changed()
-        def failed(message):
-            self.save_calibration_button.setEnabled(True)
-            self._error(message)
-        self.repo.call("save_calibrations", identifier, rows, callback=saved, on_error=failed)
+        kind, point = self._calibration_point
+        points = self._points(kind)
+        if point not in points:
+            self._error("当前测点不在设备范围内，请重新选择。")
+            return
+        identifier = self._active_device
+        if self.batch_box.isChecked():
+            answer = QMessageBox.question(
+                self, "确认批量微调", f"将修改当前设备的 {len(points)} 个同类测点，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        else:
+            points = [point]
+        rows = [dict(kind=kind, point=p, temp_offset=self.temp_offset.value(),
+                     humidity_offset=self.humidity_offset.value() if kind == "ambient" else 0) for p in points]
+        self._saving = "calibrations"
+        self._update_enabled()
 
-    def _fill_thresholds(self, *_):
-        enabled = self.device_combo.currentData() is not None
-        kind = self.threshold_kind.currentData()
-        row = self._thresholds.get(kind, {})
+        def saved(version):
+            self._saving = None
+            self.message.setText(f"微调参数已保存，共 {len(rows)} 个测点。仅对后续采集生效。")
+            if identifier == self._active_device:
+                self._devices[identifier]["calibration_version"] = version
+                self._load_parameters("calibrations")
+            self._update_enabled()
+
+        self.repo.call("save_calibrations", identifier, rows, callback=saved, on_error=self._device_save_failed)
+
+    def _threshold_changed(self, *_):
+        if not self._loaded["thresholds"]:
+            return
+        if self._threshold_dirty() and not self._confirm_discard():
+            with QSignalBlocker(self.threshold_kind):
+                self.threshold_kind.setCurrentIndex(self.threshold_kind.findData(self._threshold_type))
+            return
+        self._fill_thresholds()
+        self._update_enabled()
+
+    def _fill_thresholds(self):
+        self._threshold_type = self.threshold_kind.currentData()
+        row = self._thresholds.get(self._threshold_type, {})
         for field, editor in self.threshold_inputs.items():
-            editor.setEnabled(enabled and (not field.startswith("humidity") or kind == "ambient"))
-            value = row.get(field) if editor.isEnabled() else None
+            value = row.get(field) if not field.startswith("humidity") or self._threshold_type == "ambient" else None
             editor.setText("" if value is None else str(value))
+        self._threshold_baseline = self._threshold_text()
 
     def _save_threshold(self):
-        identifier = self.device_combo.currentData()
-        if identifier is None:
+        if not self._loaded["thresholds"] or self._saving:
+            return
+        identifier, kind = self._active_device, self._threshold_type
+        if not self._points(kind):
+            self._error("当前设备没有此类型的测点，请重新选择。")
             return
         try:
             values = {}
@@ -313,20 +518,27 @@ class SettingsPage(QWidget):
                 text = editor.text().strip() if editor.isEnabled() else ""
                 value = float(text) if text else None
                 if value is not None and not math.isfinite(value):
-                    raise ValueError("阈值必须是有限数字，或留空")
+                    raise ValueError
                 values[field] = value
         except ValueError:
             self._error("阈值必须填写数字，留空表示不启用。")
             return
-        self.save_threshold_button.setEnabled(False)
+        self._saving = "thresholds"
+        self._update_enabled()
+
         def saved(_):
-            self.save_threshold_button.setEnabled(True)
-            self.message.setText("报警阈值已保存，将根据后续有效采样判断；异常或过期数据不触发阈值报警。")
-            self._device_changed()
-        def failed(message):
-            self.save_threshold_button.setEnabled(True)
-            self._error(message)
-        self.repo.call("save_threshold", identifier, self.threshold_kind.currentData(), callback=saved, on_error=failed, **values)
+            self._saving = None
+            self.message.setText("报警阈值已保存，将根据后续有效采样判断。")
+            if identifier == self._active_device:
+                self._load_parameters("thresholds")
+            self._update_enabled()
+
+        self.repo.call("save_threshold", identifier, kind, callback=saved, on_error=self._device_save_failed, **values)
+
+    def _device_save_failed(self, message):
+        self._saving = None
+        self._update_enabled()
+        self._error(message)
 
     def _alarms_changed(self, rows):
         self._alarms = rows

@@ -1,8 +1,7 @@
 """Manual GXHT3W registration against the firmware maintenance interface.
 
-The containing window pauses polling for this profile for the dialog lifetime.
-Only explicit SAVE changes the active configuration. Never retry a write after
-an ambiguous transport failure: read the device back first.
+The host pauses polling while this editor is open. Edits remain local until
+the user saves; an ambiguous write is checked by reading the board back.
 """
 from __future__ import annotations
 
@@ -16,14 +15,14 @@ from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QFormLayout,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QComboBox, QDialog, QFileDialog,
+    QHBoxLayout, QHeaderView, QLabel, QMessageBox, QProgressBar,
+    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 from .domain import rom_bytes
-from .protocol import build_maintenance
+from .protocol import BINDING_PAGE_LIMIT, build_maintenance
 
 
 RESULT_NAMES = {
@@ -54,7 +53,7 @@ def normalise_bindings(records: Any, info: dict[str, Any]) -> list[dict[str, Any
         bus = _integer(item.get("bus"), "支路编号", 0, info["bus_count"] - 1)
         rom = rom_bytes(item.get("rom"))
         if (kind, point) in points or rom in roms:
-            raise ValueError("绑定表含重复测点或重复 ROM")
+            raise ValueError("登记表含重复测点或重复探头编码")
         points.add((kind, point))
         roms.add(rom)
         result.append({"kind": kind, "point": point, "bus": bus, "rom": rom})
@@ -91,238 +90,375 @@ def validate_backup(document: Any, address: int, info: dict[str, Any]) -> list[d
 
 
 class RegistrationDialog(QDialog):
-    # Emitted only after SAVE (including an ambiguous response reconciled by
-    # read-back), never merely on staging or reading a table.
+    # The host owns the pause for this serial profile and releases it on finished.
+    bindings_loaded = Signal(object)
     bindings_saved = Signal(object)
 
     def __init__(self, manager: Any, profile_id: str, address: int,
-                 device_name: str = "", parent: QWidget | None = None):
+                 device_name: str = "", parent: QWidget | None = None, *,
+                 embedded: bool = False, port_name: str | None = None):
         super().__init__(parent)
         _integer(address, "维护地址", 1, 247)
+        if embedded:
+            self.setWindowFlags(Qt.WindowType.Widget)
+        else:
+            self.resize(900, 620)
         self.manager, self.profile_id, self.address = manager, profile_id, address
         self.device_name = device_name or f"分机 {address}"
+        self.port_name = port_name
         self.info: dict[str, Any] | None = None
-        self.dirty = False
-        self._uncertain = False
-        self._busy = False
+        self._active: list[dict[str, Any]] | None = None
+        self._draft: list[dict[str, Any]] = []
+        self._base_generation: int | None = None
+        self._paged: bool | None = None
+        self._scan_started = 0.0
+        self._table_keys: list[tuple[str, int]] = []
         self._token, self._sequence = uuid.uuid4().hex, 0
         self._pending: dict[str, Any] | None = None
-        self._cache: dict[int, list[dict[str, Any]]] = {}
-        self._scan_records: list[dict[str, Any]] = []
-        self._scan_started = 0.0
-        self._recovering = False
-        self._closed = False
+        self._busy = self._cancel_requested = self._close_after_read = self._closed = False
+        self._writing = self._save_sent = self._recovering = self._uncertain = False
         self._goal: list[dict[str, Any]] | None = None
-        self._goal_table = 1
-        self._last_error = ""
-        self._simulator = "simulator" in profile_id.lower() or "模拟" in self.device_name
+        self._simulator = ("simulator" in profile_id.lower() or "模拟" in self.device_name)
         if callable(getattr(manager, "is_simulator", None)):
             self._simulator = bool(manager.is_simulator(profile_id))
         self.setWindowTitle(f"探头登记 · {self.device_name} · 地址 {address}")
-        self.resize(1000, 660)
         self._build_ui()
         self._scan_timer = QTimer(self)
         self._scan_timer.setInterval(300)
         self._scan_timer.timeout.connect(self._poll_scan)
         manager.response.connect(self._response)
-        manager.failure.connect(self._failure)
+        self._failure_signal = getattr(manager, "request_failed", None)
+        if self._failure_signal is None:
+            self._failure_signal = manager.failure
+            self._failure_handler = self._failure
+        else:
+            self._failure_handler = self._request_failed
+        self._failure_signal.connect(self._failure_handler)
         if hasattr(manager, "connection_changed"):
             manager.connection_changed.connect(self._connection_changed)
         self.finished.connect(self._disconnect)
         QTimer.singleShot(0, self.refresh)
 
+    @property
+    def dirty(self) -> bool:
+        return self._active is not None and self._draft != self._active
+
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        identity = QLabel(f"目标：{self.device_name}  ｜  串口配置：{self.profile_id}  ｜  分机地址：{self.address}")
-        identity.setWordWrap(True)
-        layout.addWidget(identity)
-        self.simulator_label = QLabel("模拟数据 · 不代表真实设备或实际安装位置")
-        self.simulator_label.setStyleSheet("color:#9a5800;font-weight:600;padding:6px;background:#fff3d9")
-        self.simulator_label.setVisible(self._simulator)
-        layout.addWidget(self.simulator_label)
-        note = QLabel("扫描顺序不能确定安装位置。请逐个核实实物标签后绑定；绑定只修改暂存表，点击“保存并核对”后才生效。")
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        self.info_label = QLabel("正在读取分机信息…")
-        self.info_label.setWordWrap(True)
-        layout.addWidget(self.info_label)
+        identity = f"{self.device_name} · {self.port_name or '串口配置 ' + self.profile_id} · 地址 {self.address}"
+        if self._simulator:
+            identity += " · 模拟设备"
+        title = QLabel(identity)
+        title.setObjectName("cardTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
         top = QHBoxLayout()
-        self.refresh_button = QPushButton("刷新分机信息")
-        self.refresh_button.clicked.connect(self.refresh)
-        top.addWidget(self.refresh_button)
-        top.addWidget(QLabel("扫描支路（从 0 起）"))
-        self.scan_bus = QSpinBox()
-        self.scan_bus.setRange(0, 0)
-        top.addWidget(self.scan_bus)
         self.scan_button = QPushButton("扫描探头")
         self.scan_button.clicked.connect(self.start_scan)
         top.addWidget(self.scan_button)
+        self.scan_bus_label = QLabel("扫描支路")
+        self.scan_bus = QSpinBox()
+        self.scan_bus.setRange(0, 0)
+        top.addWidget(self.scan_bus_label)
+        top.addWidget(self.scan_bus)
         top.addStretch()
+        self.refresh_button = QPushButton("重新读取分机")
+        self.refresh_button.clicked.connect(self.refresh)
+        top.addWidget(self.refresh_button)
+        self.advanced_button = QPushButton("高级选项")
+        self.advanced_button.setCheckable(True)
+        top.addWidget(self.advanced_button)
         layout.addLayout(top)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        left, right = QWidget(), QWidget()
-        left_layout, right_layout = QVBoxLayout(left), QVBoxLayout(right)
-        left_layout.addWidget(QLabel("本次完整扫描结果"))
-        self.scan_table = self._table(["支路", "探头 ROM（原始字节顺序）"])
-        self.scan_table.itemSelectionChanged.connect(self._select_probe)
-        left_layout.addWidget(self.scan_table)
-        form = QFormLayout()
-        self.rom_field = QLineEdit()
-        self.rom_field.setReadOnly(True)
-        self.rom_field.setPlaceholderText("请先扫描并选择探头")
+
+        instructions = QLabel("先扫描并核对探头编码，再选择用途和测点。确认登记表后，点击“保存到分机”。")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        form = QHBoxLayout()
+        self.probe_combo = QComboBox()
+        self.probe_combo.addItem("请先扫描探头")
+        self.probe_combo.currentIndexChanged.connect(self._update_controls)
+        form.addWidget(self.probe_combo, 1)
         self.kind_combo = QComboBox()
         self.kind_combo.addItem("粮温", "grain")
         self.kind_combo.addItem("仓温仓湿", "ambient")
         self.kind_combo.currentIndexChanged.connect(self._point_range)
-        self.point_spin, self.binding_bus = QSpinBox(), QSpinBox()
+        form.addWidget(self.kind_combo)
+        form.addWidget(QLabel("测点"))
+        self.point_spin = QSpinBox()
         self.point_spin.setRange(1, 1)
-        self.binding_bus.setRange(0, 0)
-        form.addRow("已选探头", self.rom_field)
-        form.addRow("用途", self.kind_combo)
-        form.addRow("测点编号", self.point_spin)
-        form.addRow("支路编号", self.binding_bus)
-        left_layout.addLayout(form)
-        self.bind_button = QPushButton("绑定到暂存表")
+        form.addWidget(self.point_spin)
+        self.bind_button = QPushButton("添加 / 更换绑定")
         self.bind_button.clicked.connect(self.bind_probe)
-        left_layout.addWidget(self.bind_button)
-        table_top = QHBoxLayout()
-        self.table_combo = QComboBox()
-        self.table_combo.addItem("暂存表（待保存）", 1)
-        self.table_combo.addItem("活动表（已保存）", 0)
-        self.table_combo.currentIndexChanged.connect(self._table_changed)
-        table_top.addWidget(self.table_combo)
-        self.read_button = QPushButton("完整读取")
-        self.read_button.clicked.connect(self.read_bindings)
-        table_top.addWidget(self.read_button)
-        right_layout.addLayout(table_top)
-        self.binding_table = self._table(["用途", "编号", "支路", "探头 ROM"])
-        right_layout.addWidget(self.binding_table)
-        self.unbind_button = QPushButton("解绑选中测点（暂存）")
-        self.unbind_button.clicked.connect(self.unbind_probe)
-        right_layout.addWidget(self.unbind_button)
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setSizes([460, 620])
-        layout.addWidget(splitter, 1)
-        bottom = QHBoxLayout()
-        self.save_button, self.reload_button = QPushButton("保存并核对"), QPushButton("放弃暂存修改")
-        self.backup_button, self.restore_button = QPushButton("备份活动表…"), QPushButton("从 JSON 恢复暂存表…")
-        self.save_button.clicked.connect(self.save)
-        self.reload_button.clicked.connect(self.reload)
+        form.addWidget(self.bind_button)
+        layout.addLayout(form)
+
+        self.summary_label = QLabel("正在读取已保存登记…")
+        layout.addWidget(self.summary_label)
+        self.binding_table = QTableWidget(0, 5)
+        self.binding_table.setHorizontalHeaderLabels(["用途", "测点", "探头编码", "状态", "支路"])
+        self.binding_table.verticalHeader().setDefaultSectionSize(27)
+        self.binding_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.binding_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.binding_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        header = self.binding_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.binding_table.itemSelectionChanged.connect(self._update_controls)
+        layout.addWidget(self.binding_table, 1)
+
+        self.advanced_panel = QWidget()
+        advanced = QVBoxLayout(self.advanced_panel)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        self.info_label = QLabel("正在读取分机信息…")
+        self.info_label.setWordWrap(True)
+        advanced.addWidget(self.info_label)
+        backup_actions = QHBoxLayout()
+        self.backup_button = QPushButton("备份已保存登记…")
         self.backup_button.clicked.connect(self.backup)
+        backup_actions.addWidget(self.backup_button)
+        self.restore_button = QPushButton("导入登记备份…")
         self.restore_button.clicked.connect(self.restore)
-        for button in (self.save_button, self.reload_button, self.backup_button, self.restore_button):
-            bottom.addWidget(button)
+        backup_actions.addWidget(self.restore_button)
+        backup_actions.addStretch()
+        advanced.addLayout(backup_actions)
+        self.advanced_button.toggled.connect(self.advanced_panel.setVisible)
+        self.advanced_panel.hide()
+        layout.addWidget(self.advanced_panel)
+
+        bottom = QHBoxLayout()
+        self.unbind_button = QPushButton("移除选中绑定")
+        self.unbind_button.clicked.connect(self.unbind_probe)
+        bottom.addWidget(self.unbind_button)
+        self.reload_button = QPushButton("撤销未保存修改")
+        self.reload_button.clicked.connect(self.reload)
+        bottom.addWidget(self.reload_button)
         bottom.addStretch()
-        self.close_button = QPushButton("关闭")
+        self.cancel_button = QPushButton("取消读取")
+        self.cancel_button.clicked.connect(self.cancel_read)
+        bottom.addWidget(self.cancel_button)
+        self.save_button = QPushButton("保存到分机")
+        self.save_button.setObjectName("primary")
+        self.save_button.clicked.connect(self.save)
+        bottom.addWidget(self.save_button)
+        self.close_button = QPushButton("关闭登记")
         self.close_button.clicked.connect(self.reject)
         bottom.addWidget(self.close_button)
         layout.addLayout(bottom)
+
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(5)
+        self.progress.hide()
+        layout.addWidget(self.progress)
         self.status_label = QLabel("准备登记")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
-        self._set_busy(False)
+        self._update_controls()
+
+    def _update_controls(self, *_: Any) -> None:
+        online = not self._closed and self.info is not None
+        ready = online and self._active is not None and not self._busy
+        scan_idle = online and not self.info["scan_busy"]
+        multiple = online and self.info["bus_count"] > 1
+        self.scan_bus_label.setVisible(multiple)
+        self.scan_bus.setVisible(multiple)
+        self.binding_table.setColumnHidden(4, not multiple)
+        self.scan_button.setEnabled(ready and scan_idle)
+        self.scan_bus.setEnabled(not self._busy and scan_idle)
+        self.refresh_button.setEnabled(not self._busy)
+        self.cancel_button.setVisible(self._busy and not self._writing)
+        self.cancel_button.setEnabled(not self._cancel_requested)
+        self.close_button.setEnabled(not self._writing)
+        self.probe_combo.setEnabled(ready)
+        self.kind_combo.setEnabled(ready)
+        self.point_spin.setEnabled(ready)
+        self.bind_button.setEnabled(ready and self.probe_combo.currentData() is not None)
+        self.save_button.setEnabled(ready and self.dirty and scan_idle and not self._uncertain)
+        self.reload_button.setEnabled(ready and self.dirty)
+        self.backup_button.setEnabled(ready and self.info["config_valid"])
+        self.restore_button.setEnabled(ready)
+        row = self.binding_table.currentRow()
+        selected = self.binding_table.selectedItems() and 0 <= row < len(self._table_keys)
+        self.unbind_button.setEnabled(ready and bool(selected))
+        if selected:
+            key = self._table_keys[row]
+            in_draft = any(self._key(binding) == key for binding in self._draft)
+            self.unbind_button.setText("移除选中绑定" if in_draft else "撤销移除")
+        else:
+            self.unbind_button.setText("移除选中绑定")
+
+    def _point_range(self, *_: Any) -> None:
+        if self.info is not None:
+            self.point_spin.setMaximum(self.info[f"{self.kind_combo.currentData()}_capacity"])
 
     @staticmethod
-    def _table(headers: list[str]) -> QTableWidget:
-        widget = QTableWidget(0, len(headers))
-        widget.setHorizontalHeaderLabels(headers)
-        widget.verticalHeader().setDefaultSectionSize(28)
-        widget.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        widget.horizontalHeader().setStretchLastSection(True)
-        return widget
+    def _key(row: dict[str, Any]) -> tuple[str, int]:
+        return row["kind"], row["point"]
 
-    def _set_busy(self, busy: bool) -> None:
-        self._busy = busy
-        ready = self.info is not None and not busy
-        for widget in (self.scan_button, self.read_button, self.bind_button, self.unbind_button,
-                       self.save_button, self.reload_button, self.backup_button,
-                       self.restore_button, self.table_combo, self.scan_bus, self.kind_combo,
-                       self.point_spin, self.binding_bus):
-            widget.setEnabled(ready)
-        self.refresh_button.setEnabled(not busy)
-        self.close_button.setEnabled(not busy)
-        if self.info and self.info["scan_busy"]:
-            for button in (self.scan_button, self.bind_button, self.unbind_button,
-                           self.save_button, self.reload_button, self.restore_button):
-                button.setEnabled(False)
+    def _show_bindings(self) -> None:
+        active = {self._key(row): row for row in self._active or []}
+        draft = {self._key(row): row for row in self._draft}
+        selected_row = self.binding_table.currentRow()
+        selected = self._table_keys[selected_row] if 0 <= selected_row < len(self._table_keys) else None
+        self._table_keys = sorted(active.keys() | draft.keys(), key=lambda key: (key[0] != "grain", key[1]))
+        self.binding_table.blockSignals(True)
+        self.binding_table.clearSelection()
+        self.binding_table.setRowCount(len(self._table_keys))
+        changes = 0
+        for index, key in enumerate(self._table_keys):
+            old, new = active.get(key), draft.get(key)
+            if new == old:
+                state = "已保存"
+            elif old is None:
+                state = "待新增"
+            elif new is None:
+                state = "待删除"
+            else:
+                state = "待修改"
+            changes += new != old
+            binding = new or old
+            values = ("粮温" if key[0] == "grain" else "仓温仓湿", key[1],
+                      binding["rom"].hex(" ").upper(), state, binding["bus"])
+            for column, value in enumerate(values):
+                self.binding_table.setItem(index, column, QTableWidgetItem(str(value)))
+        if selected in self._table_keys:
+            self.binding_table.selectRow(self._table_keys.index(selected))
+        self.binding_table.blockSignals(False)
+        self.summary_label.setText(f"已保存 {len(active)} 条 · 待保存 {changes} 项")
+        self._update_controls()
+
+    def _show_probes(self, rows: list[dict[str, Any]]) -> None:
+        self.probe_combo.blockSignals(True)
+        self.probe_combo.clear()
+        self.probe_combo.addItem("请选择扫描到的探头" if rows else "没有可选探头")
+        for row in rows:
+            name = row["rom"].hex(" ").upper()
+            if self.info["bus_count"] > 1:
+                name = f"支路 {row['bus']} · {name}"
+            self.probe_combo.addItem(name, row)
+        self.probe_combo.blockSignals(False)
+        self._update_controls()
+
+    def _status(self, text: str, completed: int = 0, total: int = 0) -> None:
+        self.status_label.setText(text)
+        if self._busy:
+            self.progress.setRange(0, total)
+            self.progress.setValue(completed)
+
+    def _start(self, text: str) -> None:
+        self._busy = True
+        self._cancel_requested = False
+        self.progress.show()
+        self._status(text)
+        self._update_controls()
 
     def _finish(self, text: str) -> None:
         self._scan_timer.stop()
         self._goal = None
-        self._set_busy(False)
-        self.status_label.setText(text)
+        self._busy = self._writing = self._save_sent = self._recovering = self._cancel_requested = False
+        self.progress.hide()
+        self._status(text)
+        self._update_controls()
 
     def _error(self, message: str) -> None:
         if self._recovering:
-            self._recovering = False
             self._uncertain = True
-        self._last_error = message
+            message = f"暂未确认分机保存结果。请重新读取分机；没有重发写请求。\n{message}"
         self._finish(message)
         QMessageBox.warning(self, "操作未完成", message)
 
-    def _request(self, op: int, payload: bytes, callback: Callable[[dict], None],
-                 *, allow: tuple[int, ...] = (0,), write: bool = False) -> None:
+    def cancel_read(self) -> None:
+        if not self._busy or self._writing:
+            return
+        self._scan_timer.stop()
+        self._cancel_requested = True
+        if self._pending is None:
+            self._read_cancelled()
+        else:
+            self._status("正在取消，等待当前串口请求结束…")
+            self._update_controls()
+
+    def _read_cancelled(self) -> None:
+        close, self._close_after_read = self._close_after_read, False
+        self._finish("已取消读取，本地编辑保留。")
+        if close:
+            self.reject()
+
+    def _request(self, op: int, payload: bytes, callback: Callable[[dict], None], *,
+                 allow: tuple[int, ...] = (0,), expected: dict[str, Any] | None = None) -> None:
         if self._pending is not None:
             raise RuntimeError("已有维护请求等待响应")
         self._sequence += 1
         context = {"registration": self._token, "sequence": self._sequence}
-        if write:
-            self._uncertain = True
-            self.dirty = True
-        self._pending = {"context": context, "op": op, "callback": callback,
-                         "allow": allow, "write": write}
+        self._pending = {"context": context, "op": op, "callback": callback, "allow": allow}
+        if op in (3, 4, 5) and not self._writing:
+            self._writing = self._uncertain = True
+            self._update_controls()
         try:
-            self.manager.submit(self.profile_id, build_maintenance(self.address, op, payload),
-                                {"protocol": "maintenance", "address": self.address, "op": op},
-                                context=context)
+            match = {"protocol": "maintenance", "address": self.address, "op": op}
+            if expected:
+                match.update(expected)
+            self.manager.submit(self.profile_id, build_maintenance(self.address, op, payload), match, context=context)
         except Exception as exc:
             self._failure(self.profile_id, str(exc))
 
     def _response(self, profile_id: str, envelope: object, raw: bytes) -> None:
-        if profile_id != self.profile_id or not isinstance(envelope, dict) or not self._pending:
+        if profile_id != self.profile_id or not isinstance(envelope, dict) or self._pending is None:
             return
         pending = self._pending
         if envelope.get("context") != pending["context"]:
             return
         self._pending = None
+        if self._cancel_requested:
+            self._read_cancelled()
+            return
         parsed = envelope.get("parsed")
         try:
-            if not isinstance(parsed, dict) or parsed.get("protocol") != "maintenance" or \
-                    parsed.get("address") != self.address or parsed.get("op") != pending["op"]:
+            if (not isinstance(parsed, dict) or parsed.get("protocol") != "maintenance"
+                    or parsed.get("address") != self.address or parsed.get("op") != pending["op"]):
                 raise ValueError("维护响应与本次请求不匹配")
             result = parsed.get("result")
             if result not in pending["allow"]:
                 raise ValueError(RESULT_NAMES.get(result, f"未知分机结果码：{result}"))
             pending["callback"](parsed)
         except (ValueError, KeyError, TypeError, RuntimeError) as exc:
-            if pending["write"]:
-                self._recover_write(f"写操作未能确认：{exc}")
-            else:
-                self._error(str(exc))
+            self._operation_error(str(exc))
+
+    def _request_failed(self, profile_id: str, context: object, message: str) -> None:
+        if self._pending is not None and context == self._pending["context"]:
+            self._failure(profile_id, message)
 
     def _failure(self, profile_id: str, message: str) -> None:
         if profile_id != self.profile_id or self._pending is None:
             return
-        pending, self._pending = self._pending, None
-        if pending["write"]:
-            self._recover_write(f"写操作响应超时或通信中断：{message}")
+        self._pending = None
+        if self._cancel_requested:
+            self._read_cancelled()
         else:
-            if self._recovering:
-                self._recovering = False
-                self._uncertain = True
-                self.dirty = True
-                self._error(f"配置结果仍不确定，未重发任何写命令。请检查连接后重新读取配置。\n{message}")
-            else:
-                self._error(f"通信失败，操作未完成：{message}")
+            self._operation_error(f"通信失败：{message}")
+
+    def _operation_error(self, message: str) -> None:
+        if self._writing and not self._recovering:
+            self._recover_write(message)
+        else:
+            self._error(message)
 
     def _connection_changed(self, profile_id: str, connected: bool, message: str) -> None:
-        if profile_id == self.profile_id and not connected and self._busy:
-            self._pending = None
-            self._error("连接已断开，当前操作未完成。写操作可能已生效，请重连后完整读取配置核对。\n" + message)
+        if profile_id != self.profile_id or connected:
+            return
+        self._pending = None
+        self._uncertain = self._uncertain or self._writing
+        self.info = None
+        self._paged = None
+        self._show_probes([])
+        self.info_label.setText("串口已断开")
+        if self._cancel_requested:
+            self._read_cancelled()
+        elif self._busy:
+            self._error("连接已断开。请重连后重新读取分机。\n" + message)
+        else:
+            self._finish("连接已断开，本地编辑保留。")
 
     def _get_info(self, callback: Callable[[], None]) -> None:
         def done(parsed: dict) -> None:
@@ -331,98 +467,138 @@ class RegistrationDialog(QDialog):
                 raise ValueError("分机维护接口版本不受支持")
             for name in ("grain_capacity", "ambient_capacity", "bus_count"):
                 _integer(value.get(name), name, 1, MAX_BINDINGS)
-            if value["bus_count"] > 256 or value["grain_capacity"] + value["ambient_capacity"] > MAX_BINDINGS:
+            total = value["grain_capacity"] + value["ambient_capacity"]
+            if total > MAX_BINDINGS or value["bus_count"] > 256:
                 raise ValueError("分机返回的容量超出登记工具支持范围")
-            total_capacity = value["grain_capacity"] + value["ambient_capacity"]
-            _integer(value.get("active_count"), "活动绑定数", 0, total_capacity)
-            _integer(value.get("discovered_count"), "已发现数", 0, total_capacity)
+            _integer(value.get("active_count"), "已保存绑定数", 0, total)
+            _integer(value.get("discovered_count"), "已发现数", 0, total)
             _integer(value.get("generation"), "配置代次", 0, 0xFFFFFFFF)
             self.info = dict(value)
-            self.dirty = bool(value["dirty"])
             self.scan_bus.setMaximum(value["bus_count"] - 1)
-            self.binding_bus.setMaximum(value["bus_count"] - 1)
             self._point_range()
             self.info_label.setText(
-                f"接口 V{value['version']} ｜ 配置{'有效' if value['config_valid'] else '未保存'}"
-                f" ｜ 暂存{'有修改' if self.dirty else '无修改'} ｜ 已保存 {value['active_count']} 点"
-                f" ｜ 代次 {value['generation']} ｜ 粮温 {value['grain_capacity']} 点"
-                f" / 仓温仓湿 {value['ambient_capacity']} 点 / {value['bus_count']} 支路")
+                f"维护接口 V{value['version']} · 配置代次 {value['generation']} · "
+                f"{value['bus_count']} 支路 · 粮温容量 {value['grain_capacity']} · "
+                f"仓温仓湿容量 {value['ambient_capacity']} · 扫描状态 {value['scan_status']} · "
+                f"分机暂存{'有未保存修改' if value['dirty'] else '无修改'}")
+            self._update_controls()
             callback()
         self._request(0, b"", done)
 
     def refresh(self) -> None:
         if self._busy or self._closed:
             return
-        self._set_busy(True)
-        self.status_label.setText("读取分机信息与绑定表…")
-        self._get_info(lambda: self._read_table(self.table_combo.currentData(),
-                       lambda rows: self._finish(f"已完整读取 {len(rows)} 条绑定；扫描状态码 {self.info['scan_status']}")))
+        if self.dirty and QMessageBox.question(
+                self, "重新读取分机", "读取成功后将以分机已保存登记替换本地修改。继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self._start("正在读取分机信息…")
 
-    def _point_range(self, *_: Any) -> None:
-        if self.info:
-            self.point_spin.setMaximum(self.info[f"{self.kind_combo.currentData()}_capacity"])
-
-    def _table_changed(self, *_: Any) -> None:
-        self._show_bindings(self._cache.get(self.table_combo.currentData(), []))
-
-    def _show_bindings(self, rows: list[dict[str, Any]]) -> None:
-        self.binding_table.setRowCount(len(rows))
-        for index, row in enumerate(rows):
-            values = ("粮温" if row["kind"] == "grain" else "仓温仓湿", row["point"],
-                      row["bus"], row["rom"].hex(" ").upper())
-            for column, value in enumerate(values):
-                self.binding_table.setItem(index, column, QTableWidgetItem(str(value)))
+        def loaded(rows: list[dict]) -> None:
+            self._active = rows
+            self._draft = rows.copy()
+            self._base_generation = self.info["generation"]
+            self._uncertain = False
+            self._show_bindings()
+            warning = "；分机上另有未保存修改" if self.info["dirty"] else ""
+            self._finish(f"已读取分机的 {len(rows)} 条登记{warning}。")
+            self.bindings_loaded.emit({"generation": self._base_generation, "bindings": [row.copy() for row in rows]})
+        self._get_info(lambda: self._read_table(0, loaded))
 
     def _read_table(self, table: int, callback: Callable[[list[dict]], None]) -> None:
-        assert self.info is not None
-        keys = [(kind, point) for kind in ("grain", "ambient")
-                for point in range(1, self.info[f"{kind}_capacity"] + 1)]
-        rows: list[dict] = []
-        self._cache.pop(table, None)
+        info = self.info
+        assert info is not None
+        label = "已保存登记" if table == 0 else "分机暂存登记"
 
-        def next_point(index: int) -> None:
-            if index == len(keys):
-                checked = normalise_bindings(rows, self.info)
-                if table == 0 and len(checked) != self.info["active_count"]:
-                    raise ValueError("完整读取的活动表数量与 INFO 不一致，请重新读取")
-                self._cache[table] = checked
-                if self.table_combo.currentData() == table:
-                    self._show_bindings(checked)
-                callback(checked)
+        def complete(rows: list[dict]) -> None:
+            checked = normalise_bindings(rows, info)
+            if table == 0 and len(checked) != info["active_count"]:
+                raise ValueError("已保存登记数量与分机信息不一致，请重新读取")
+            callback(checked)
+
+        def legacy() -> None:
+            if info["active_count"] == 0 and not info["dirty"]:
+                complete([])
                 return
-            kind, point = keys[index]
-            self.status_label.setText(f"读取{'暂存' if table else '活动'}表 {index + 1}/{len(keys)}…")
+            keys = [(kind, point) for kind in ("grain", "ambient")
+                    for point in range(1, info[f"{kind}_capacity"] + 1)]
+            rows = []
+
+            def next_point(index: int) -> None:
+                if index == len(keys):
+                    if table == 0:
+                        def verified() -> None:
+                            if (self.info["generation"], self.info["active_count"]) != (info["generation"], info["active_count"]):
+                                raise ValueError("读取期间分机保存代次或数量已变化，请重新读取")
+                            complete(rows)
+                        self._get_info(verified)
+                    else:
+                        complete(rows)
+                    return
+                kind, point = keys[index]
+                self._status(f"旧固件逐点读取{label} {index + 1}/{len(keys)}…", index, len(keys))
+
+                def got(parsed: dict) -> None:
+                    if parsed["result"] == 0:
+                        binding = parsed["binding"]
+                        if (self._key(binding) != (kind, point) or binding["table"] != table):
+                            raise ValueError("收到其他测点的绑定，已停止读取")
+                        rows.append(binding)
+                    next_point(index + 1)
+                payload = self._point_payload(kind, point) + bytes((table,))
+                self._request(7, payload, got, allow=(0, 7), expected={"kind": kind, "point": point, "table": table})
+            next_point(0)
+
+        if self._paged is False:
+            legacy()
+            return
+        rows = []
+        snapshot: tuple[int, int] | None = None
+        capacity = info["grain_capacity"] + info["ambient_capacity"]
+
+        def page(offset: int) -> None:
+            self._status(f"正在读取{label} · 已收到 {offset} 条…", offset, snapshot[0] if snapshot else 0)
+            fallback = offset == 0 and self._paged is None
 
             def got(parsed: dict) -> None:
-                if parsed["result"] == 0:
-                    row = parsed["binding"]
-                    if row["kind"] != kind or row["point"] != point or row["table"] != table:
-                        raise ValueError("分机返回了其他测点的绑定，已停止读取")
-                    rows.append({key: row[key] for key in ("kind", "point", "bus", "rom")})
-                next_point(index + 1)
-            self._request(7, bytes([1 if kind == "grain" else 2]) + point.to_bytes(2, "big") + bytes([table]),
-                          got, allow=(0, 7))
-        next_point(0)
-
-    def read_bindings(self) -> None:
-        if self._busy or not self.info:
-            return
-        self._set_busy(True)
-        self._get_info(lambda: self._read_table(self.table_combo.currentData(),
-                       lambda rows: self._finish(f"完整读取完成：{len(rows)} 条绑定")))
+                nonlocal snapshot
+                if fallback and parsed["result"] in (1, 2):
+                    self._paged = False
+                    legacy()
+                    return
+                total = _integer(parsed["total"], "绑定数", 0, capacity)
+                revision = _integer(parsed["revision"], "绑定表修订号", 0, 0xFFFFFFFF)
+                records = parsed["records"]
+                if (parsed["table"] != table or parsed["offset"] != offset or
+                        not isinstance(records, list) or len(records) != min(BINDING_PAGE_LIMIT, total - offset)):
+                    raise ValueError("登记分页内容不一致，请重新读取")
+                if table == 0 and revision != info["generation"]:
+                    raise ValueError("读取期间分机保存代次已变化，请重新读取")
+                if snapshot is not None and snapshot != (total, revision):
+                    raise ValueError("读取期间登记表已变化，请重新读取")
+                snapshot = (total, revision)
+                self._paged = True
+                rows.extend(records)
+                if len(rows) == total:
+                    complete(rows)
+                else:
+                    page(len(rows))
+            payload = bytes((table,)) + offset.to_bytes(2, "big") + bytes((BINDING_PAGE_LIMIT,))
+            self._request(9, payload, got, allow=(0, 1, 2) if fallback else (0,),
+                          expected={"table": table, "offset": offset, "limit": BINDING_PAGE_LIMIT,
+                                    "bus_count": info["bus_count"]})
+        page(0)
 
     def start_scan(self) -> None:
         if self._busy or not self.info:
             return
-        self._set_busy(True)
-        self._scan_records = []
-        self.scan_table.setRowCount(0)
-        self.rom_field.clear()
+        self._start("正在扫描探头…")
+        self._show_probes([])
         self._scan_started = time.monotonic()
-        self.status_label.setText("请求扫描，等待分机完整搜索结束…")
-        self._request(1, bytes([self.scan_bus.value()]), self._scan_accepted)
+        self._request(1, bytes((self.scan_bus.value(),)), self._scan_accepted)
 
-    def _scan_accepted(self, parsed: dict) -> None:
+    def _scan_accepted(self, _: dict) -> None:
         self._scan_timer.start()
         self._poll_scan()
 
@@ -430,191 +606,211 @@ class RegistrationDialog(QDialog):
         if self._pending is not None:
             return
         if time.monotonic() - self._scan_started > 60:
-            self._error("等待扫描结束超时。本次结果未作为完整扫描使用，请刷新分机信息。")
+            self._error("等待扫描结束超时，未使用部分结果。请重新读取分机。")
             return
 
         def checked() -> None:
-            assert self.info is not None
             if self.info["scan_busy"]:
-                self.status_label.setText(f"扫描中，分机已发现 {self.info['discovered_count']} 个探头…")
+                self._status(f"正在扫描 · 已发现 {self.info['discovered_count']} 个探头…")
                 return
             self._scan_timer.stop()
-            if self.info["scan_status"] != 0:
-                raise ValueError(f"扫描未完整成功：{RESULT_NAMES.get(self.info['scan_status'], '未知错误')}。未使用部分结果。")
-            self._scan_page(0, self.info["discovered_count"])
+            status = self.info["scan_status"]
+            if status != 0:
+                raise ValueError(f"扫描未完整成功：{RESULT_NAMES.get(status, '未知错误')}。")
+            self._scan_pages(self.info["discovered_count"])
         self._get_info(checked)
 
-    def _scan_page(self, offset: int, total: int) -> None:
-        assert self.info is not None
-        if total > self.info["grain_capacity"] + self.info["ambient_capacity"]:
-            raise ValueError("发现探头数超过分机容量，未使用本次扫描")
+    def _scan_pages(self, total: int) -> None:
+        rows, roms = [], set()
 
-        def got(parsed: dict) -> None:
-            records = parsed["records"]
-            if parsed["total"] != total or parsed["offset"] != offset or len(records) > 27 or \
-                    offset + len(records) > total or (offset < total and not records):
-                raise ValueError("扫描分页数量不完整或前后不一致，已停止登记")
-            for record in records:
-                bus = _integer(record["bus"], "扫描支路", 0, self.info["bus_count"] - 1)
-                rom = rom_bytes(record["rom"])
-                if bus != self.scan_bus.value() or any(row["rom"] == rom for row in self._scan_records):
-                    raise ValueError("扫描结果出现重复 ROM 或支路不匹配")
-                self._scan_records.append({"bus": bus, "rom": rom})
-            if len(self._scan_records) < total:
-                self._scan_page(len(self._scan_records), total)
+        def page(offset: int) -> None:
+            if offset == total:
+                self._show_probes(rows)
+                self._finish(f"找到 {total} 个探头。请选择探头并核对实物标签。" if total
+                             else "未找到探头。请检查接线后重新扫描。")
                 return
-            self.scan_table.setRowCount(total)
-            for index, row in enumerate(self._scan_records):
-                self.scan_table.setItem(index, 0, QTableWidgetItem(str(row["bus"])))
-                self.scan_table.setItem(index, 1, QTableWidgetItem(row["rom"].hex(" ").upper()))
-            self._finish(f"完整扫描成功：{total} 个探头。请根据实物位置人工指定测点编号。")
-        self._request(2, offset.to_bytes(2, "big") + b"\x1b", got)
 
-    def _select_probe(self) -> None:
-        index = self.scan_table.currentRow()
-        if 0 <= index < len(self._scan_records):
-            row = self._scan_records[index]
-            self.rom_field.setText(row["rom"].hex(" ").upper())
-            self.binding_bus.setValue(row["bus"])
+            def got(parsed: dict) -> None:
+                records = parsed["records"]
+                if parsed["total"] != total or parsed["offset"] != offset or not records:
+                    raise ValueError("扫描分页不完整或前后不一致")
+                for record in records:
+                    bus = _integer(record["bus"], "扫描支路", 0, self.info["bus_count"] - 1)
+                    rom = rom_bytes(record["rom"])
+                    if rom in roms or bus != self.scan_bus.value():
+                        raise ValueError("扫描结果出现重复探头编码或支路不符")
+                    roms.add(rom)
+                    rows.append({"bus": bus, "rom": rom})
+                page(len(rows))
+            self._request(2, offset.to_bytes(2, "big") + b"\x1b", got,
+                          expected={"offset": offset, "scan_count": 27})
+        page(0)
 
-    def _verify_staged(self, text: str) -> None:
-        goal = self._goal
-
-        def read(rows: list[dict]) -> None:
-            if goal is not None and rows != goal:
-                raise ValueError("暂存表回读与目标不一致，请完整读取并核对；活动表尚未切换")
-            def confirmed() -> None:
-                self._uncertain = False
-                self._finish(text + "；需点击保存才能生效")
-            self._get_info(confirmed)
-        self._read_table(1, read)
-
-    def bind_probe(self) -> None:
-        if self._busy or not self.info:
-            return
+    def _edit(self, rows: list[dict], message: str) -> None:
         try:
-            rom = rom_bytes(self.rom_field.text())
+            self._draft = normalise_bindings(rows, self.info)
         except ValueError as exc:
             self._error(str(exc))
             return
-        kind, point, bus = self.kind_combo.currentData(), self.point_spin.value(), self.binding_bus.value()
-        selected = next((row for row in self._scan_records if row["rom"] == rom), None)
-        if selected is None or selected["bus"] != bus:
-            self._error("请选择本次完整扫描到的探头，并使用它实际所属的支路")
-            return
-        self._set_busy(True)
+        self._show_bindings()
+        self._status(message)
 
-        def read(rows: list[dict]) -> None:
-            old = next((row for row in rows if row["kind"] == kind and row["point"] == point), None)
-            if old and old["rom"] != rom and QMessageBox.question(
-                    self, "更换测点探头", f"将{'粮温' if kind == 'grain' else '仓温仓湿'} {point} 的探头\n"
-                    f"{old['rom'].hex().upper()}\n更换为\n{rom.hex().upper()}？") != QMessageBox.StandardButton.Yes:
-                self._finish("已取消绑定")
-                return
-            target = [row for row in rows if (row["kind"], row["point"]) != (kind, point)]
-            target = normalise_bindings(target + [{"kind": kind, "point": point, "bus": bus, "rom": rom}], self.info)
-            payload = bytes([1 if kind == "grain" else 2]) + point.to_bytes(2, "big") + bytes([bus]) + rom
-            self._goal, self._goal_table = target, 1
-            self._request(3, payload, lambda _: self._verify_staged("绑定已回读核对"), write=True)
-        self._read_table(1, read)
+    def bind_probe(self) -> None:
+        probe = self.probe_combo.currentData()
+        if self._busy or not self.info or self._active is None or probe is None:
+            return
+        key = self.kind_combo.currentData(), self.point_spin.value()
+        binding = {"kind": key[0], "point": key[1], **probe}
+        rows = [row for row in self._draft if self._key(row) != key]
+        self._edit(rows + [binding], "已更新本地登记。点击“保存到分机”提交。")
 
     def unbind_probe(self) -> None:
-        if self._busy or not self.info:
+        row = self.binding_table.currentRow()
+        if (self._busy or self._active is None or not self.binding_table.selectedItems()
+                or not 0 <= row < len(self._table_keys)):
             return
-        cached = self._cache.get(self.table_combo.currentData())
-        index = self.binding_table.currentRow()
-        if cached is None or not 0 <= index < len(cached):
-            self._error("请先完整读取绑定表并选择要解绑的测点")
-            return
-        selected = cached[index]
-        if QMessageBox.question(self, "确认解绑", f"从暂存表移除{'粮温' if selected['kind'] == 'grain' else '仓温仓湿'} "
-                                f"{selected['point']}？保存前活动表保持当前配置。") != QMessageBox.StandardButton.Yes:
-            return
-        self._set_busy(True)
-
-        def read(rows: list[dict]) -> None:
-            self._goal = [row for row in rows if (row["kind"], row["point"]) != (selected["kind"], selected["point"])]
-            self._goal_table = 1
-            payload = bytes([1 if selected["kind"] == "grain" else 2]) + selected["point"].to_bytes(2, "big")
-            self._request(4, payload, lambda _: self._verify_staged("解绑已回读核对"), write=True)
-        self._read_table(1, read)
-
-    def save(self) -> None:
-        if self._busy or not self.info:
-            return
-        self._set_busy(True)
-
-        def staged(rows: list[dict]) -> None:
-            self._goal, self._goal_table = rows, 0
-
-            def saved(_: dict) -> None:
-                self._get_info(lambda: self._verify_saved(rows))
-            self._request(5, b"", saved, write=True)
-        self._read_table(1, staged)
-
-    def _verify_saved(self, goal: list[dict]) -> None:
-        if not self.info or not self.info["config_valid"] or self.info["dirty"]:
-            raise ValueError("保存后的分机状态未确认，请重新读取核对")
-
-        def done(rows: list[dict]) -> None:
-            if rows != goal:
-                raise ValueError("保存后的活动表与目标不一致，不能确认保存成功")
-            self._uncertain = False
-            self.bindings_saved.emit({"generation": self.info["generation"], "bindings": rows})
-            self._finish(f"保存成功，已完整回读核对 {len(rows)} 条活动绑定（代次 {self.info['generation']}）")
-        self._read_table(0, done)
+        key = self._table_keys[row]
+        rows = [binding for binding in self._draft if self._key(binding) != key]
+        if len(rows) == len(self._draft):
+            original = next(binding for binding in self._active if self._key(binding) == key)
+            self._edit(rows + [original], "已撤销移除。")
+        else:
+            self._edit(rows, "已在本地移除绑定。点击“保存到分机”提交。")
 
     def reload(self) -> None:
-        if self._busy:
+        if self._busy or not self.dirty:
             return
-        if QMessageBox.question(self, "放弃暂存修改", "重新加载活动配置，放弃全部未保存的绑定修改？") != QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, "撤销未保存修改", "将本地登记恢复为上次读取的已保存登记？",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
-        self._set_busy(True)
+        self._draft = self._active.copy()
+        self._show_bindings()
+        self._status("已撤销本地修改。")
 
-        def loaded(_: dict) -> None:
-            def verified(rows: list[dict]) -> None:
-                self._uncertain = False
-                self._finish(f"已重新加载 {len(rows)} 条已保存绑定")
-            self._get_info(lambda: self._read_table(1, verified))
-        self._request(6, b"", loaded, write=True)
+    @staticmethod
+    def _point_payload(kind: str, point: int) -> bytes:
+        return bytes((1 if kind == "grain" else 2,)) + point.to_bytes(2, "big")
 
-    def _recover_write(self, cause: str) -> None:
-        self._scan_timer.stop()
-        self._uncertain, self.dirty, self._recovering = True, True, True
-        self.status_label.setText("写入结果未确认，正在只读核对配置；不会自动重发写命令…")
-        goal, table = self._goal, self._goal_table
+    def save(self) -> None:
+        if self._busy or not self.info or not self.dirty or self._uncertain:
+            return
+        self._start("正在核对分机当前登记…")
+        self._goal = self._draft.copy()
 
         def info_ready() -> None:
-            def verified(rows: list[dict]) -> None:
-                confirmed = goal is not None and rows == goal
-                if table == 0:
-                    confirmed = confirmed and bool(self.info["config_valid"]) and not self.info["dirty"]
-                self._recovering = False
-                self._uncertain = not confirmed
-                if confirmed:
-                    if table == 0:
-                        self.bindings_saved.emit({"generation": self.info["generation"], "bindings": rows})
-                    self._finish("原写请求未收到有效确认；只读回查已与目标一致。" +
-                                 ("活动配置已核对。" if table == 0 else "暂存配置已核对，仍需保存。"))
+            if self.info["scan_busy"]:
+                raise ValueError("分机还在扫描，请等待后重试。")
+            normalise_bindings(self._goal, self.info)
+            if self.info["generation"] != self._base_generation:
+                raise ValueError("分机已保存的登记有变化，请重新读取并核对后再保存。")
+
+            def checked(rows: list[dict]) -> None:
+                if rows != self._active:
+                    raise ValueError("分机已保存的登记有变化，请重新读取并核对后再保存。")
+                if self.info["dirty"]:
+                    self._read_table(1, staged_ready)
                 else:
-                    self._error(cause + f"\n已完整回读{'活动' if table == 0 else '暂存'}表，请核对实际配置。未自动重发写命令。")
-            self._read_table(table, verified)
+                    staged_ready(rows)
+
+            def staged_ready(rows: list[dict]) -> None:
+                board_dirty = self.info["dirty"]
+                if rows != self._active and rows != self._goal and QMessageBox.question(
+                        self, "核对分机暂存修改", "分机上还有一份未保存的登记。用本地登记替换并保存？",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                    self._finish("已取消保存，本地编辑保留。")
+                    return
+
+                def still_current() -> None:
+                    if (self.info["scan_busy"] or self.info["generation"] != self._base_generation
+                            or self.info["active_count"] != len(self._active) or self.info["dirty"] != board_dirty):
+                        raise ValueError("分机状态已变化，请重新读取并核对后再保存。")
+                    self._write_changes(rows)
+                self._get_info(still_current)
+            self._read_table(0, checked)
         self._get_info(info_ready)
+
+    def _write_changes(self, staged: list[dict]) -> None:
+        assert self._goal is not None
+        old = {self._key(row): row for row in staged}
+        target = {self._key(row): row for row in self._goal}
+        target_by_rom = {row["rom"]: key for key, row in target.items()}
+        # Free the old slot before binding a ROM to a different slot, including swaps.
+        operations = [(4, self._point_payload(*key)) for key, row in old.items()
+                      if key not in target or target_by_rom.get(row["rom"], key) != key]
+        operations.extend((3, self._point_payload(*key) + bytes((row["bus"],)) + row["rom"])
+                          for key, row in target.items() if old.get(key) != row)
+
+        def step(index: int) -> None:
+            if index < len(operations):
+                self._status(f"正在更新分机登记 {index + 1}/{len(operations)}…", index, len(operations))
+                op, payload = operations[index]
+                self._request(op, payload, lambda _: step(index + 1))
+                return
+            self._status("正在核对分机暂存登记…")
+
+            def checked(rows: list[dict]) -> None:
+                if rows != self._goal:
+                    raise ValueError("分机暂存登记与本地登记不一致，未提交保存。")
+                self._status("正在保存到分机…")
+                self._save_sent = True
+                self._request(5, b"", lambda _: self._get_info(self._verify_saved))
+
+            def info_ready() -> None:
+                if self.info["generation"] != self._base_generation:
+                    raise ValueError("保存前分机配置代次变化，未提交保存。")
+                self._read_table(1, checked)
+            self._get_info(info_ready)
+        step(0)
+
+    def _verify_saved(self) -> None:
+        if not self.info["config_valid"] or self.info["dirty"]:
+            raise ValueError("分机尚未确认保存，请回读核对。")
+
+        def checked(rows: list[dict]) -> None:
+            if rows != self._goal:
+                raise ValueError("回读的已保存登记与本地登记不一致。")
+            self._saved(rows, f"已保存并核对 {len(rows)} 条登记。")
+        self._read_table(0, checked)
+
+    def _saved(self, rows: list[dict], message: str) -> None:
+        self._active = rows
+        self._draft = rows.copy()
+        self._base_generation = self.info["generation"]
+        self._uncertain = False
+        self._show_bindings()
+        self._finish(message)
+        self.bindings_saved.emit({"generation": self._base_generation, "bindings": [row.copy() for row in rows]})
+
+    def _recover_write(self, cause: str) -> None:
+        self._recovering = True
+        self._status("写入未获确认，正在只读回查分机…")
+
+        def checked(rows: list[dict]) -> None:
+            self._uncertain = False
+            if self._save_sent and rows == self._goal and self.info["config_valid"] and not self.info["dirty"]:
+                self._saved(rows, "保存响应未确认；只读回查已与目标一致，分机已保存。")
+                return
+            location = "已保存登记" if self._save_sent else "暂存登记"
+            self._recovering = False
+            self._error(f"{cause}\n已回读分机{location}（{len(rows)} 条），未自动重发。请核对后再保存。")
+        self._get_info(lambda: self._read_table(0 if self._save_sent else 1, checked))
 
     def backup(self) -> None:
         if self._busy or not self.info:
             return
-        self._set_busy(True)
+        self._start("正在读取分机登记以备份…")
 
         def info_ready() -> None:
             if not self.info["config_valid"]:
-                raise ValueError("分机尚无有效活动配置，请先登记并保存")
+                raise ValueError("分机尚无已保存登记，请先保存。")
             generation = self.info["generation"]
 
             def rows_ready(rows: list[dict]) -> None:
                 def checked() -> None:
                     if self.info["generation"] != generation:
-                        raise ValueError("备份读取期间配置代次变化，请重新备份")
+                        raise ValueError("备份读取期间配置已变化，请重新备份。")
                     document = {
                         "format": "warehouse-registration-v1", "table": "active",
                         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -625,9 +821,10 @@ class RegistrationDialog(QDialog):
                         "binding_count": len(rows),
                         "bindings": [{**row, "rom": row["rom"].hex().upper()} for row in rows],
                     }
-                    filename, _ = QFileDialog.getSaveFileName(self, "备份完整活动表", f"分机{self.address}_登记备份.json", "JSON (*.json)")
+                    filename, _ = QFileDialog.getSaveFileName(
+                        self, "备份已保存登记", f"分机{self.address}_登记备份.json", "JSON (*.json)")
                     if not filename:
-                        self._finish("已取消备份")
+                        self._finish("已取消备份。")
                         return
                     try:
                         destination = Path(filename)
@@ -637,13 +834,13 @@ class RegistrationDialog(QDialog):
                     except OSError as exc:
                         self._error(f"备份文件未写入成功：{exc}")
                         return
-                    self._finish(f"已备份 {len(rows)} 条活动绑定：{filename}")
+                    self._finish(f"已备份 {len(rows)} 条登记：{filename}")
                 self._get_info(checked)
             self._read_table(0, rows_ready)
         self._get_info(info_ready)
 
     def restore(self) -> None:
-        if self._busy or not self.info:
+        if self._busy or not self.info or self._active is None:
             return
         filename, _ = QFileDialog.getOpenFileName(self, "选择登记备份", "", "JSON (*.json)")
         if not filename:
@@ -654,54 +851,33 @@ class RegistrationDialog(QDialog):
                 raise ValueError("备份文件过大")
             document = json.loads(path.read_text(encoding="utf-8"))
             target = validate_backup(document, self.address, self.info)
+            if document["simulated"] != self._simulator:
+                raise ValueError("模拟设备与真实设备的备份不能混用")
         except (OSError, ValueError, TypeError, KeyError) as exc:
-            self._error(f"备份校验失败，未修改分机：{exc}")
+            self._error(f"备份未导入：{exc}")
             return
-        if bool(document.get("simulated")) != self._simulator:
-            self._error("模拟备份与真实设备备份不能混用，未修改分机")
-            return
-        phrase = f"恢复地址{self.address}"
-        typed, accepted = QInputDialog.getText(
-            self, "核对目标分机后恢复", f"来源：{document['board'].get('name', '未命名')}，地址 {document['board']['address']}\n"
-            f"目标：{self.device_name}，配置 {self.profile_id}，地址 {self.address}\n"
-            f"将完整替换暂存表为 {len(target)} 条绑定，活动表需另行保存。\n"
-            "同地址不能证明是同一块板，请核对实物及 ROM 安装位置。\n"
-            f"确认后输入：{phrase}")
-        if not accepted or typed.strip() != phrase:
-            self.status_label.setText("已取消恢复，分机未修改")
-            return
-        self._set_busy(True)
-        self._goal, self._goal_table = target, 1
-
-        def info_ready() -> None:
-            # Validate again against live capacities before changing anything.
-            validate_backup(document, self.address, self.info)
-
-            def current_ready(current: list[dict]) -> None:
-                operations = [(4, bytes([1 if row["kind"] == "grain" else 2]) + row["point"].to_bytes(2, "big")) for row in current]
-                operations += [(3, bytes([1 if row["kind"] == "grain" else 2]) + row["point"].to_bytes(2, "big") + bytes([row["bus"]]) + row["rom"]) for row in target]
-
-                def step(index: int) -> None:
-                    if index == len(operations):
-                        self._verify_staged("备份已完整恢复到暂存表并回读核对")
-                        return
-                    self.status_label.setText(f"恢复暂存表 {index + 1}/{len(operations)}；活动表尚未切换…")
-                    op, payload = operations[index]
-                    self._request(op, payload, lambda _: step(index + 1), write=True)
-                step(0)
-            self._read_table(1, current_ready)
-        self._get_info(info_ready)
+        source = document["board"].get("name", "未命名")
+        if QMessageBox.question(
+                self, "导入到本地登记表",
+                f"从“{source}”导入 {len(target)} 条登记，替换当前待编辑表？\n"
+                "请核对探头位置，点击“保存到分机”才会提交。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self._edit(target, f"已导入 {len(target)} 条到本地登记表，请核对后保存到分机。")
 
     def reject(self) -> None:
+        if self._writing:
+            QMessageBox.information(self, "正在保存", "请等待分机保存和核对完成后再关闭。")
+            return
         if self._busy:
-            QMessageBox.information(self, "操作进行中", "请等待当前请求结束。写入结果未确认前不关闭登记窗口。")
+            self._close_after_read = True
+            self.cancel_read()
             return
         if self.dirty or self._uncertain:
-            answer = QMessageBox.question(self, "尚有未保存或未确认的配置",
-                "分机暂存表可能有未保存的更改，关闭不会自动保存或放弃。\n仍要关闭登记窗口？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
+            message = ("分机保存状态尚未核对，关闭后请重新读取核对。\n" if self._uncertain else "")
+            if QMessageBox.question(self, "关闭登记", message + "关闭后将丢弃本地未保存修改。继续？",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
         super().reject()
 
@@ -710,9 +886,11 @@ class RegistrationDialog(QDialog):
         self.reject()
 
     def _disconnect(self, *_: Any) -> None:
+        if self._closed:
+            return
         self._closed = True
         self._scan_timer.stop()
-        connections = [(self.manager.response, self._response), (self.manager.failure, self._failure)]
+        connections = [(self.manager.response, self._response), (self._failure_signal, self._failure_handler)]
         if hasattr(self.manager, "connection_changed"):
             connections.append((self.manager.connection_changed, self._connection_changed))
         for signal, slot in connections:

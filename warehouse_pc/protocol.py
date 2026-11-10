@@ -15,6 +15,7 @@ from .domain import crc8 as crc8, rom_bytes
 
 GRAIN_CAPACITY = 165
 AMBIENT_CAPACITY = 5
+BINDING_PAGE_LIMIT = 20
 AMBIENT_BASE = 0x2000
 STATUS_BASE = 0x4000
 STATUS_UNAVAILABLE = 255  # FFFF does not identify the underlying sensor fault.
@@ -108,6 +109,12 @@ def build_maintenance(address: int, op: int, payload: bytes = b"") -> bytes:
         raise ProtocolError("维护参数过长")
     if op == 3:
         _maintenance_rom(payload[4:])
+    elif op == 9 and (
+        len(payload) != 4 or payload[0] not in (0, 1)
+        or _word(payload, 1) > GRAIN_CAPACITY + AMBIENT_CAPACITY
+        or not 1 <= payload[3] <= BINDING_PAGE_LIMIT
+    ):
+        raise ProtocolError("绑定分页请求的表、偏移或条数无效")
     return with_crc(bytes((address, 0x41, op)) + payload)
 
 
@@ -275,6 +282,19 @@ def parse_modbus_response(frame: bytes, **context: Any) -> dict[str, Any]:
     return result
 
 
+def _binding_page_header(data: bytes, context: dict[str, Any]) -> tuple[int, int, int, int]:
+    table, total, offset, count = data[0], _word(data, 1), _word(data, 3), data[5]
+    if (table not in (0, 1) or total > GRAIN_CAPACITY + AMBIENT_CAPACITY or offset > total
+            or count > BINDING_PAGE_LIMIT or offset + count > total
+            or (count == 0 and offset < total)):
+        raise ProtocolError("绑定分页的表、偏移或条数无效")
+    if table != context.get("table", table) or offset != context.get("offset", offset):
+        raise ProtocolError("绑定分页与请求的表或偏移不匹配")
+    if "limit" in context and count != min(context["limit"], total - offset):
+        raise ProtocolError("绑定分页返回的条数与请求不匹配")
+    return table, total, offset, count
+
+
 def parse_maintenance(frame: bytes, **context: Any) -> dict[str, Any]:
     frame = bytes(frame)
     _validate_modbus_response(frame, 0x41, context.get("address"))
@@ -328,6 +348,29 @@ def parse_maintenance(frame: bytes, **context: Any) -> dict[str, Any]:
             int.from_bytes(data[4:6], "big", signed=True) / 10 if status == 0 else None,
             _word(data, 6) / 10 if status == 0 else None, status)
         result["updated_ms"] = int.from_bytes(data[8:12], "big")
+    elif op == 9:
+        if len(data) < 10:
+            raise ProtocolError("绑定分页响应过短")
+        table, total, offset, count = _binding_page_header(data, context)
+        if len(data) != 10 + 12 * count:
+            raise ProtocolError("绑定分页响应长度无效")
+        records = []
+        points, roms = set(), set()
+        for index in range(10, len(data), 12):
+            kind = {1: "grain", 2: "ambient"}.get(data[index])
+            point, bus = _word(data, index + 1), data[index + 3]
+            capacity = GRAIN_CAPACITY if kind == "grain" else AMBIENT_CAPACITY
+            if kind is None or not 1 <= point <= capacity or bus >= context.get("bus_count", 256):
+                raise ProtocolError("绑定分页的测点类型、编号或支路无效")
+            rom = _maintenance_rom(data[index + 4:index + 12])
+            if (kind, point) in points or rom in roms:
+                raise ProtocolError("绑定分页包含重复测点或 ROM")
+            points.add((kind, point))
+            roms.add(rom)
+            records.append({"kind": kind, "point": point, "bus": bus,
+                            "rom": rom, "rom_hex": rom.hex().upper()})
+        result.update(table=table, total=total, offset=offset,
+                      revision=int.from_bytes(data[6:10], "big"), records=records)
     elif op not in lengths:
         raise ProtocolError("未定义的维护成功响应")
     return result
@@ -384,6 +427,11 @@ def response_length(buffer: bytes, expected: dict[str, Any]) -> int | None:
         if "scan_count" in expected and buffer[8] > expected["scan_count"]:
             raise ProtocolError("扫描返回条数超过请求")
         return 11 + 9 * buffer[8]
+    if op == 9:
+        if len(buffer) < 10:
+            return None
+        _, _, _, count = _binding_page_header(buffer[4:10], expected)
+        return 16 + 12 * count
     lengths = {0: 24, 1: 6, 3: 6, 4: 6, 5: 6, 6: 6, 7: 19, 8: 18}
     if op not in lengths:
         raise ProtocolError("未知维护操作")

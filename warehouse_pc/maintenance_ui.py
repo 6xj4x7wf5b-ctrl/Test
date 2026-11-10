@@ -127,7 +127,7 @@ class MaintenancePage(QWidget):
 
         cleanup_box = QGroupBox("按时间清理采集历史")
         cleanup_layout = QVBoxLayout(cleanup_box)
-        cleanup_note = QLabel("先统计范围内记录数，再确认删除。仅清理采集记录，保留仓房、分机、登记、修正值和报警设置。")
+        cleanup_note = QLabel("预览时继续采集，确认后暂停并核对记录数。仅清理采集记录，保留档案、设置和报警记录。")
         cleanup_note.setWordWrap(True)
         cleanup_layout.addWidget(cleanup_note)
         form = QFormLayout()
@@ -154,7 +154,12 @@ class MaintenancePage(QWidget):
         cleanup_layout.addLayout(form)
         layout.addWidget(cleanup_box)
 
-        layout.addWidget(QLabel("运行日志（最多显示 1000 行）"))
+        log_row = QHBoxLayout()
+        log_row.addWidget(QLabel("运行日志（最多显示 1000 行）"), 1)
+        self.diagnostics_button = QPushButton("导出通信诊断…")
+        self.diagnostics_button.clicked.connect(self.export_communication_diagnostics)
+        log_row.addWidget(self.diagnostics_button)
+        layout.addLayout(log_row)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.document().setMaximumBlockCount(1000)
@@ -164,7 +169,7 @@ class MaintenancePage(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self._actions = [self.backup_button, self.restore_button, self.export_button,
-                         self.import_button, self.cleanup_button,
+                         self.import_button, self.cleanup_button, self.diagnostics_button,
                          self.device_combo, self.start_date, self.end_date]
 
     def append_log(self, text: str) -> None:
@@ -199,6 +204,23 @@ class MaintenancePage(QWidget):
                 raise OSError("系统未能打开目录")
         except OSError as exc:
             self._error(f"无法打开数据目录：{exc}")
+
+    def export_communication_diagnostics(self) -> None:
+        if self._busy:
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "导出通信诊断", str(self.data_dir / f"通信诊断_{datetime.now():%Y%m%d_%H%M%S}.json"),
+            "JSON 诊断文件 (*.json)")
+        if not filename:
+            return
+        try:
+            if Path(filename).resolve() == self.db_path.resolve():
+                raise ValueError("诊断文件不能覆盖正在使用的数据库")
+            count = self.controller.export_communication_diagnostics(filename)
+        except (OSError, ValueError) as exc:
+            self._error(f"未导出通信诊断：{exc}")
+            return
+        self._finish(f"已导出通信诊断（{count} 条通信记录）：{filename}")
 
     def _set_busy(self, value: bool, text: str = "") -> None:
         changed = self._busy != value
@@ -385,33 +407,31 @@ class MaintenancePage(QWidget):
             return
         identifier = self.device_combo.currentData()
         name = self.device_combo.currentText()
-        self._resume_running = bool(self.controller.running)
-        self.controller.set_running(False)
-        self._set_busy(True, "已暂停新增轮询，正在统计待清理采集记录…")
+        self._set_busy(True, "正在统计待清理采集记录，采集继续运行…")
 
         def counted(count: int) -> None:
             if count == 0:
-                self._resume_after_cleanup()
                 self._finish("所选范围没有采集记录，未删除任何内容")
                 return
             answer = QMessageBox.question(self, "确认删除采集历史",
                 f"分机：{name}\n范围：{start} 至 {end}（含起止）\n"
                 f"预统计 {count:,} 条采集记录，将永久删除这些范围内的采集记录。\n"
-                "仓房、分机、登记、修正值和报警设置保留。是否继续？",
+                "确认后会暂停采集并再次核对记录数。仓房、分机、登记、修正值和报警记录保留。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
-                self._resume_after_cleanup()
                 self._finish("已取消清理，历史记录未修改")
                 return
-            self.status_label.setText("正在清理已确认范围的采集历史…")
+            self._resume_running = bool(self.controller.running)
+            if self._resume_running:
+                self.controller.set_running(False)
+            self.status_label.setText("正在核对并清理已确认范围的采集历史…")
 
             def deleted(actual: int) -> None:
                 self.controller.refresh_alarms()
                 self._resume_after_cleanup()
-                suffix = f"（预统计 {count:,} 条，实际以删除时为准）" if actual != count else ""
-                self._finish(f"已清理 {actual:,} 条采集历史{suffix}；档案与设置保留")
+                self._finish(f"已清理 {actual:,} 条采集历史；档案、设置及报警记录保留")
             self._call("clear_history", start=start, end=end, device_id=identifier,
-                       dry_run=False, callback=deleted)
+                       dry_run=False, expected_count=count, callback=deleted)
         self._call("clear_history", start=start, end=end, device_id=identifier,
                    dry_run=True, callback=counted)

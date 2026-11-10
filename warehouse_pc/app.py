@@ -125,7 +125,7 @@ class MainWindow(QMainWindow):
         add_nav("首页", 5, nav_layout, mode="home")
         groups = [
             ("仓房管理", "settings", [("仓房信息管理", 6, None), ("温度点管理", 0, 1)]),
-            ("设备管理", "monitoring", [("测温分机管理", 1, None), ("串口连接", 1, None), ("探头登记", 1, None)]),
+            ("设备管理", "monitoring", [("测温分机管理", 1, None), ("串口设置", 1, None), ("探头登记", 1, None)]),
             ("采集规则", "grid", [("测温分机采集规则", 3, 0)]),
             ("数据管理", "database", [("粮情总览", 5, None), ("粮情详情", 0, None), ("历史曲线", 2, None), ("历史记录", 2, None)]),
             ("系统维护", "settings", [("温湿度微调", 3, 1), ("报警记录", 3, 2), ("本地维护", 4, None)]),
@@ -231,6 +231,7 @@ class MainWindow(QMainWindow):
         self.overview.detail_requested.connect(self.open_detail)
         self.overview.history_requested.connect(lambda: self.navigate(2))
         self.live.action_requested.connect(self.live_action)
+        self.devices.mode_requested.connect(lambda mode: self.navigate(1, "探头登记"))
         self.maintenance.busy_changed.connect(self.set_maintenance_busy)
         for page in (self.live, self.devices, self.history, self.settings, self.maintenance, self.overview, self.warehouses):
             self.stack.addWidget(page)
@@ -266,15 +267,23 @@ class MainWindow(QMainWindow):
         self.repo.thread.finished.connect(self._database_finished)
 
     def navigate(self, index, title=None, tab=None, mode=None):
-        self.stack.setCurrentIndex(index)
         title = title or self.page_titles[index][0]
+        if self.stack.currentIndex() == 1 and index != 1 and not self.devices.can_leave():
+            return
+        if index == 1:
+            device_mode = {"探头登记": "registration", "串口设置": "ports", "串口连接": "ports"}.get(title, "devices")
+            if not self.devices.set_mode(device_mode):
+                return
+        self.stack.setCurrentIndex(index)
         for nav, page, label, group in self.nav_routes:
             active = page == index and label == title
             nav.setChecked(active)
             if active and group:
                 self.group_buttons[group].setChecked(True)
         self.title.setText(title)
-        self.subtitle.setText(self.page_titles[index][1])
+        self.subtitle.setText({"测温分机管理": "管理仓房分机、板上地址与登记状态",
+                               "串口设置": "选择实际 COM 口、设置通信参数并打开串口",
+                               "探头登记": "扫描探头、核对测点并统一保存到分机"}.get(title, self.page_titles[index][1]))
         if index == 5:
             self.overview.set_mode(mode or ("overview" if title == "粮情总览" else "home"))
         if index == 3 and tab is not None:
@@ -282,6 +291,7 @@ class MainWindow(QMainWindow):
         if index == 0 and tab is not None:
             self.live.tabs.setCurrentIndex(tab)
         if index == 2:
+            self.history.set_view_mode("curve" if title == "历史曲线" else "records")
             if not self._history_opened:
                 self._history_opened = True
                 self.history._recent()
@@ -294,7 +304,7 @@ class MainWindow(QMainWindow):
     def update_topbar(self):
         self.local_summary.setText(f"本地仓房 {len(self.controller.metadata['warehouses'])} 个")
         count = sum(self.controller.manager.is_connected(str(p['id'])) for p in self.controller.metadata['ports'])
-        self.connection_pill.setText(f"串口已连接 {count} 个")
+        self.connection_pill.setText(f"串口已打开 {count} 个")
 
     def open_detail(self, identifier):
         self.navigate(0)
@@ -307,10 +317,8 @@ class MainWindow(QMainWindow):
             self.live.edit_layout()
         elif action == "register":
             self.navigate(1, "探头登记")
-            index = next((i for i,d in enumerate(self.controller.metadata['devices']) if d['id'] == identifier), -1)
-            if index >= 0:
-                self.devices.devices_table.selectRow(index)
-                self.devices.register()
+            self.devices.registration_device.setCurrentIndex(self.devices.registration_device.findData(identifier))
+            self.devices.register()
         elif action == "calibration":
             self.navigate(3, "温湿度微调", 1)
             self.settings.device_combo.setCurrentIndex(self.settings.device_combo.findData(identifier))
@@ -324,7 +332,7 @@ class MainWindow(QMainWindow):
     def toggle_collection(self):
         if not self.controller.running:
             if not self.controller.metadata["devices"]:
-                QMessageBox.information(self, "尚未配置分机", "请先在“设备与连接”中添加仓房、串口和分机。")
+                QMessageBox.information(self, "尚未配置分机", "请先在“测温分机管理”中添加仓房、串口和分机。")
                 self.navigate(1)
                 return
             self.controller.connect_all()
@@ -358,6 +366,8 @@ class MainWindow(QMainWindow):
             return
         event.ignore()
         if self._closing:
+            return
+        if not self.devices.can_leave():
             return
         self._closing = True
         self.sound_timer.stop()

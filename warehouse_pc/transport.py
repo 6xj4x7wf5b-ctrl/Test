@@ -7,17 +7,23 @@ reduces late-response misassociation in protocols without transaction IDs.
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 from .protocol import (
+    AMBIENT_CAPACITY, BINDING_PAGE_LIMIT, GRAIN_CAPACITY,
     DeviceException, ProtocolError, crc16, lc_response_length,
     parse_response, response_length,
 )
 from .simulator import ProtocolSimulator
+
+DIAGNOSTIC_EVENT_LIMIT = 1000
+DIAGNOSTIC_BYTE_LIMIT = 256
 
 
 def is_simulated_port(port_name: str) -> bool:
@@ -33,6 +39,12 @@ class _Request:
     timeout_ms: int
     retries: int
     attempts: int = 0
+    received_bytes: int = 0
+    late_bytes: int = 0
+    crc_errors: int = 0
+    mismatch_errors: int = 0
+    discarded_partial_bytes: int = 0
+    last_parse_error: str | None = None
 
 
 @dataclass
@@ -67,6 +79,62 @@ class SerialManager(QObject):
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._channels: dict[str, _Channel] = {}
+        self._diagnostic_events: deque[dict[str, Any]] = deque(maxlen=DIAGNOSTIC_EVENT_LIMIT)
+
+    @staticmethod
+    def _diagnostic_settings(channel: _Channel) -> dict[str, Any]:
+        serial = channel.serial
+        settings = {
+            "profile_id": channel.profile_id, "port_name": channel.port_name,
+            "baud": channel.baud, "data_bits": 8, "parity": channel.parity,
+            "stop_bits": channel.stop_bits, "flow_control": "NoFlowControl",
+            "connected": channel.connected,
+            "source": "simulator" if is_simulated_port(channel.port_name) else "serial",
+            "settings_source": "configured",
+        }
+        if serial is not None and serial.isOpen():
+            parity = {QSerialPort.Parity.NoParity: "N", QSerialPort.Parity.EvenParity: "E",
+                      QSerialPort.Parity.OddParity: "O"}
+            actual_parity = serial.parity()
+            settings.update(port_name=serial.portName(), baud=serial.baudRate(),
+                            data_bits=serial.dataBits().value, parity=parity.get(actual_parity, actual_parity.name),
+                            stop_bits=serial.stopBits().value, flow_control=serial.flowControl().name,
+                            settings_source="open_qt_port")
+        return settings
+
+    def diagnostics_snapshot(self) -> dict[str, Any]:
+        return {
+            "time_basis": "UTC host event time. Receive chunks are host callbacks, not wire timing.",
+            "channels": [self._diagnostic_settings(channel) for channel in self._channels.values()],
+            "events": deepcopy(list(self._diagnostic_events)),
+        }
+
+    def _record(self, event: str, channel: _Channel, wire: bytes | bytearray = b"", **details: Any) -> None:
+        item = channel.active
+        entry = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "event": event, **self._diagnostic_settings(channel),
+            "byte_count": len(wire), "bytes_hex": wire[:DIAGNOSTIC_BYTE_LIMIT].hex(" ").upper(),
+            "truncated": len(wire) > DIAGNOSTIC_BYTE_LIMIT,
+        }
+        if item is not None:
+            entry.update(attempt=item.attempts, request_epoch=channel.epoch,
+                         protocol=item.expected.get("protocol"), address=item.expected.get("address"),
+                         command=item.expected.get("op", item.expected.get("command")))
+        entry.update(details)
+        self._diagnostic_events.append(entry)
+
+    @staticmethod
+    def _response_summary(item: _Request | None, buffered: int) -> dict[str, Any]:
+        if item is None:
+            return {}
+        return {
+            "received_bytes": item.received_bytes, "late_bytes": item.late_bytes,
+            "crc_errors": item.crc_errors,
+            "mismatch_errors": item.mismatch_errors,
+            "partial_bytes": item.discarded_partial_bytes + buffered,
+            "last_parse_error": item.last_parse_error,
+        }
 
     @staticmethod
     def available_ports() -> list[dict[str, str]]:
@@ -162,6 +230,7 @@ class SerialManager(QObject):
         serial.errorOccurred.connect(lambda error: self._serial_error(channel, error))
         if not serial.open(QSerialPort.OpenModeFlag.ReadWrite):
             message = serial.errorString()
+            self._record("FAIL", channel, reason="open_error", message=message)
             channel.serial = None
             serial.deleteLater()
             self.failure.emit(profile_id, f"无法打开 {channel.port_name}：{message}")
@@ -169,6 +238,8 @@ class SerialManager(QObject):
             return
         channel.connected = True
         serial.clear()
+        if not channel.connected:
+            return
         self.connection_changed.emit(profile_id, True,
             f"{channel.port_name} 已连接 · {channel.baud} 8{channel.parity}{channel.stop_bits}")
 
@@ -260,6 +331,16 @@ class SerialManager(QObject):
             if request[2] == 2 and len(payload) == 3:
                 context.setdefault("offset", int.from_bytes(payload[:2], "big"))
                 context.setdefault("scan_count", payload[2])
+            if request[2] == 9:
+                if len(payload) != 4:
+                    raise ProtocolError("绑定分页请求长度无效")
+                table, offset, limit = payload[0], int.from_bytes(payload[1:3], "big"), payload[3]
+                if table not in (0, 1) or offset > GRAIN_CAPACITY + AMBIENT_CAPACITY or not 1 <= limit <= BINDING_PAGE_LIMIT:
+                    raise ProtocolError("绑定分页请求的表、偏移或条数无效")
+                for key, value in (("table", table), ("offset", offset), ("limit", limit)):
+                    if key in context and context[key] != value:
+                        raise ProtocolError("绑定分页请求与预期不一致")
+                    context[key] = value
         return context
 
     def submit(self, profile_id: str, request: bytes, expected: dict[str, Any], context: object = None) -> None:
@@ -277,7 +358,7 @@ class SerialManager(QObject):
             expected = self._expected(request, expected)
             safe_read = expected["protocol"] == "modbus" or (
                 expected["protocol"] == "lc" and expected["command"] in (0xD0, 0xD1, 0xD2, 0xD8, 0xD9)) or (
-                expected["protocol"] == "maintenance" and expected["op"] in (0, 2, 7, 8))
+                expected["protocol"] == "maintenance" and expected["op"] in (0, 2, 7, 8, 9))
             retries = min(2, max(0, int(expected.get("retries", 1)))) if safe_read else 0
             bits = 1 + 8 + (channel.parity != "N") + channel.stop_bits
             max_reply = lc_response_length(expected["command"], **{key: value for key, value in expected.items() if key != "command"}) if expected["protocol"] == "lc" else 256
@@ -288,6 +369,7 @@ class SerialManager(QObject):
             if not 20 <= timeout <= 120000:
                 raise ProtocolError("请求超时需在20～120000毫秒之间")
         except (ValueError, TypeError, KeyError) as error:
+            self._record("FAIL", channel, reason="invalid_request", message=str(error))
             self.request_failed.emit(profile_id, context, str(error))
             self.failure.emit(profile_id, str(error))
             return
@@ -307,10 +389,18 @@ class SerialManager(QObject):
         item.attempts += 1
         channel.epoch += 1
         channel.buffer.clear()
-        if channel.serial:
-            channel.serial.clear(QSerialPort.Direction.Input)
-            if channel.serial.write(item.wire) != len(item.wire):
-                self._finish_failure(channel, "串口请求写入失败")
+        serial = channel.serial
+        if serial is not None:
+            serial.clear(QSerialPort.Direction.Input)
+            if channel.active is not item:
+                return
+        self._record("TX_SUBMIT", channel, item.wire, timeout_ms=item.timeout_ms)
+        if serial is not None:
+            written = serial.write(item.wire)
+            if channel.active is not item:
+                return
+            if written != len(item.wire):
+                self._finish_failure(channel, "串口请求写入失败", reason="write_error")
                 return
         assert channel.timeout is not None
         channel.timeout.start(item.timeout_ms)
@@ -325,7 +415,7 @@ class SerialManager(QObject):
             assert channel.simulator is not None
             wire = channel.simulator.simulate_request(item.wire, item.expected)
         except Exception as error:
-            self._finish_failure(channel, f"模拟器错误：{error}")
+            self._finish_failure(channel, f"模拟器错误：{error}", reason="simulator_error")
             return
         if wire:
             # Exercise the same stream parser used for real ports, in fragments.
@@ -340,21 +430,31 @@ class SerialManager(QObject):
     def _receive(self, channel: _Channel, incoming: bytes) -> None:
         if not incoming or not channel.connected:
             return
+        disposition = "draining" if channel.draining else "in_flight" if channel.active else "unsolicited"
+        self._record("RX_CHUNK", channel, incoming, disposition=disposition)
         if channel.draining:
+            if channel.active:
+                channel.active.received_bytes += len(incoming)
+                channel.active.late_bytes += len(incoming)
             assert channel.quiet is not None
             channel.quiet.start(channel.quiet_ms)
             return
         if channel.active is None:
             return  # Unsolicited/late traffic cannot become a future response.
+        item = channel.active
+        item.received_bytes += len(incoming)
         channel.buffer.extend(incoming)
         if len(channel.buffer) > 4096:
+            item.discarded_partial_bytes += len(channel.buffer)
+            item.last_parse_error = "接收缓冲超过上限"
             channel.buffer.clear()
             return
-        item = channel.active
         while channel.buffer and channel.active is item:
             try:
                 length = response_length(channel.buffer, item.expected)
-            except ProtocolError:
+            except ProtocolError as error:
+                item.mismatch_errors += 1
+                item.last_parse_error = str(error)
                 del channel.buffer[0]
                 continue
             if length is None or len(channel.buffer) < length:
@@ -363,12 +463,19 @@ class SerialManager(QObject):
             try:
                 parsed = parse_response(wire, item.expected)
             except DeviceException as error:
-                self._finish_failure(channel, str(error))
+                self._finish_failure(channel, str(error), reason="device_exception")
                 return
-            except ProtocolError:
+            except ProtocolError as error:
+                item.last_parse_error = str(error)
+                if "CRC" in item.last_parse_error.upper():
+                    item.crc_errors += 1
+                else:
+                    item.mismatch_errors += 1
                 del channel.buffer[0]
                 continue
             channel.timeout.stop()
+            self._record("PARSE_OK", channel, wire, result=parsed.get("result"),
+                         **self._response_summary(item, 0))
             channel.active = None
             channel.buffer.clear()
             simulated = is_simulated_port(channel.port_name)
@@ -406,6 +513,8 @@ class SerialManager(QObject):
         # Continuous unsolicited bytes must not keep a retry/queue alive forever.
         if not channel.connected or not channel.draining:
             return
+        self._record("FAIL", channel, reason="continuous_unexpected_data",
+                     **self._response_summary(channel.active, len(channel.buffer)))
         self.disconnect_port(channel.profile_id)
         self.failure.emit(channel.profile_id, "串口持续收到非预期数据，无法恢复静默，已断开连接")
 
@@ -414,14 +523,21 @@ class SerialManager(QObject):
         if item is None or not channel.connected:
             return
         if item.attempts <= item.retries:
+            self._record("FAIL", channel, channel.buffer, reason="timeout_retry",
+                         **self._response_summary(item, len(channel.buffer)))
+            item.discarded_partial_bytes += len(channel.buffer)
             self._begin_drain(channel, 100, retry=True)
             return
-        self._finish_failure(channel, "请求超时，未获得匹配的完整响应", quarantine=True)
+        self._finish_failure(channel, "请求超时，未获得匹配的完整响应", quarantine=True,
+                             reason="no_data" if not item.received_bytes else "unmatched_data")
 
-    def _finish_failure(self, channel: _Channel, message: str, *, quarantine: bool = False) -> None:
+    def _finish_failure(self, channel: _Channel, message: str, *, quarantine: bool = False,
+                        reason: str = "request_error") -> None:
         if channel.timeout:
             channel.timeout.stop()
         item = channel.active
+        self._record("FAIL", channel, channel.buffer, reason=reason, message=message,
+                     **self._response_summary(item, len(channel.buffer)))
         channel.active = None
         channel.buffer.clear()
         # Set draining before emitting signals: callbacks may submit new work.
@@ -437,7 +553,9 @@ class SerialManager(QObject):
         fatal = (QSerialPort.SerialPortError.ResourceError, QSerialPort.SerialPortError.DeviceNotFoundError,
                  QSerialPort.SerialPortError.ReadError, QSerialPort.SerialPortError.WriteError,
                  QSerialPort.SerialPortError.PermissionError)
+        message = channel.serial.errorString() if channel.serial else "串口错误"
+        self._record("FAIL", channel, channel.buffer, reason="serial_error", message=message,
+                     error=error.name, **self._response_summary(channel.active, len(channel.buffer)))
         if error in fatal:
-            message = channel.serial.errorString() if channel.serial else "串口错误"
             self.disconnect_port(channel.profile_id)
             self.failure.emit(channel.profile_id, message)

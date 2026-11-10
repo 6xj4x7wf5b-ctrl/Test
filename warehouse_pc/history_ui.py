@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ from PySide6.QtCore import QDateTime, Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDateTimeEdit, QFileDialog, QFrame,
-    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSpinBox,
+    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton, QSpinBox,
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -38,7 +39,7 @@ def _number(value: Any) -> str:
 class HistoryPage(QWidget):
     """Read-only history page; cleanup belongs to the separate maintenance UI.
 
-    Public methods: ``refresh(metadata=None)``, ``query()``. Both are safe for
+    Public methods: ``refresh(metadata=None)``, ``query()``, ``set_view_mode(mode)``. Safe for
     repeated calls; generation tokens discard old repository callbacks.
     Selecting a row chooses that device/type/point for the trend only.
     """
@@ -52,6 +53,8 @@ class HistoryPage(QWidget):
         self._devices: dict[int, dict[str, Any]] = {}
         self._rows: list[dict[str, Any]] = []
         self._filters: dict[str, Any] | None = None
+        self._applied_filters: dict[str, Any] | None = None
+        self._view_mode = "records"
         self._query_version = self._plot_version = 0
         self._offset = self._total = 0
         self._count_loading = self._rows_loading = False
@@ -72,13 +75,13 @@ class HistoryPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
-        title = QLabel("历史数据")
-        title.setObjectName("title")
-        subtitle = QLabel("按接收时间查询 · 原始读数与当时微调结果分别保存 · 历史曲线每次只看一个测点")
-        subtitle.setObjectName("subtitle")
-        subtitle.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        self.title = QLabel("历史记录")
+        self.title.setObjectName("title")
+        self.subtitle = QLabel("按接收时间查询 · 原始读数与当时微调结果分别保存")
+        self.subtitle.setObjectName("subtitle")
+        self.subtitle.setWordWrap(True)
+        layout.addWidget(self.title)
+        layout.addWidget(self.subtitle)
 
         filters = QFrame()
         filters.setObjectName("card")
@@ -142,7 +145,7 @@ class HistoryPage(QWidget):
         layout.addWidget(self.export_label)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
-        table_area = QWidget()
+        self.table_area = table_area = QWidget()
         table_layout = QVBoxLayout(table_area)
         table_layout.setContentsMargins(0, 0, 0, 0)
         headers = ["接收时间", "仓房", "分机", "类型", "点号", "原始温度 ℃", "修正温度 ℃",
@@ -170,7 +173,7 @@ class HistoryPage(QWidget):
         for size in (100, 200, 500):
             self.page_size.addItem(f"每页 {size} 条", size)
         self.page_size.setCurrentIndex(1)
-        self.page_size.currentIndexChanged.connect(lambda: self.query())
+        self.page_size.currentIndexChanged.connect(self._resize_page)
         pages.addWidget(self.previous_button)
         pages.addWidget(self.page_label)
         pages.addWidget(self.next_button)
@@ -179,11 +182,12 @@ class HistoryPage(QWidget):
         table_layout.addLayout(pages)
         splitter.addWidget(table_area)
 
-        curve_area = QFrame()
+        self.curve_area = curve_area = QFrame()
+        curve_area.hide()
         curve_area.setObjectName("card")
         curve_layout = QVBoxLayout(curve_area)
         curve_layout.setContentsMargins(8, 6, 8, 6)
-        self.curve_label = QLabel("单测点曲线：点击表格某行，或指定分机、类型和具体点号后查询")
+        self.curve_label = QLabel("单测点曲线：选择分机、类型和具体点号后查询")
         self.curve_label.setWordWrap(True)
         curve_layout.addWidget(self.curve_label)
         curves = QHBoxLayout()
@@ -207,6 +211,26 @@ class HistoryPage(QWidget):
         self.start_edit.dateTimeChanged.connect(self._mark_edited)
         self.end_edit.dateTimeChanged.connect(self._mark_edited)
         self._update_pagination()
+
+    def set_view_mode(self, mode: str):
+        if mode not in ("curve", "records"):
+            raise ValueError("历史视图必须为 curve 或 records")
+        if mode == self._view_mode:
+            return
+        self._view_mode = mode
+        curve = mode == "curve"
+        self.title.setText("历史曲线" if curve else "历史记录")
+        self.subtitle.setText("按接收时间查询 · 指定分机、类型和点号查看单点趋势" if curve else
+                              "按接收时间查询 · 原始读数与当时微调结果分别保存")
+        self.table_area.setVisible(not curve)
+        self.curve_area.setVisible(curve)
+        self._update_pagination()
+        self._plot_version += 1
+        if curve and self._filters is not None:
+            if self._plot_selection is None and self._rows:
+                self._select_plot(self._rows[0])
+            else:
+                self._load_plot()
 
     @staticmethod
     def _plot(label, units):
@@ -244,8 +268,8 @@ class HistoryPage(QWidget):
         self.device_combo.setCurrentIndex(max(0, index))
         self.device_combo.blockSignals(False)
         self._filter_changed(mark=False)
-        if query:
-            self.query()
+        if query and self._filters is not None:
+            self._load_page()
 
     def _filter_changed(self, *_args, mark=True):
         kind = self.kind_combo.currentData()
@@ -294,10 +318,10 @@ class HistoryPage(QWidget):
                    (("device_id", device), ("kind", kind), ("point", point))):
                 self._plot_selection = None
         self._load_page()
-        if self._plot_selection:
+        if self._plot_selection and self._view_mode == "curve":
             self._load_plot()
         else:
-            self._clear_plot("点击表格某行查看该测点曲线；不会将不同测点连接在一起。")
+            self._clear_plot("指定分机、类型和点号；未指定时显示第一条匹配记录所属测点。")
 
     def _valid_query(self, version):
         return not self._disposed and self._query_version == version
@@ -309,6 +333,7 @@ class HistoryPage(QWidget):
         version, offset, size = self._query_version, self._offset, self.page_size.currentData()
         filters = self._filters.copy()
         self._count_loading = self._rows_loading = True
+        self._applied_filters = None
         self.status_label.setText("正在后台查询历史记录…")
         self._update_pagination()
 
@@ -317,6 +342,7 @@ class HistoryPage(QWidget):
                 self._query_version += 1
                 self._count_loading = self._rows_loading = False
                 self._rows, self._total, self._offset = [], 0, 0
+                self._filters = None
                 self.table.setRowCount(0)
                 self._update_pagination()
                 self.status_label.setText(f"历史查询失败：{error}")
@@ -334,7 +360,7 @@ class HistoryPage(QWidget):
                 self._offset = 0
                 self._load_page()
                 return
-            self._update_pagination()
+            finish()
 
         def loaded(rows):
             if not self._valid_query(version):
@@ -342,9 +368,14 @@ class HistoryPage(QWidget):
             self._rows = list(rows or [])
             self._rows_loading = False
             self._show_rows()
+            if self._view_mode == "curve" and self._plot_selection is None and self._rows:
+                self._select_plot(self._rows[0])
+            finish()
+
+        def finish():
+            if not self._count_loading and not self._rows_loading:
+                self._applied_filters = filters.copy()
             self._update_pagination()
-            if self._plot_selection is None and self._rows:
-                self.table.selectRow(0)
 
         self.repo.call("history_count_filters", **filters, callback=counted, on_error=failed)
         self.repo.call("history_page", **filters, limit=size, offset=offset, callback=loaded, on_error=failed)
@@ -383,11 +414,19 @@ class HistoryPage(QWidget):
         self.page_label.setText(f"第 {current} / {pages} 页")
         self.previous_button.setEnabled(not loading and self._offset > 0)
         self.next_button.setEnabled(not loading and self._offset + size < self._total)
+        self._update_export_buttons()
         if not loading and self._filters is not None:
             if self._rows:
-                self.status_label.setText(f"共 {self._total:,} 条 · 当前显示第 {self._offset + 1:,}～{self._offset + len(self._rows):,} 条")
+                text = f"共 {self._total:,} 条"
+                if self._view_mode == "records":
+                    text += f" · 当前显示第 {self._offset + 1:,}～{self._offset + len(self._rows):,} 条"
             else:
-                self.status_label.setText("所选范围没有历史记录。")
+                text = "所选范围没有历史记录。"
+            try:
+                edited = self._selected_filters() != self._filters
+            except ValueError:
+                edited = True
+            self.status_label.setText(text + (" · 筛选已修改，点击“查询”应用" if edited else ""))
 
     def _change_page(self, direction):
         if self._filters is None or self._count_loading or self._rows_loading:
@@ -398,13 +437,21 @@ class HistoryPage(QWidget):
             self._offset = offset
             self._load_page()
 
+    def _resize_page(self, *_):
+        if self._filters is not None:
+            self._offset = 0
+            self._load_page()
+
     def _row_selected(self):
         index = self.table.currentRow()
         if not self.table.selectedItems() or not 0 <= index < len(self._rows):
             return
-        row = self._rows[index]
+        self._select_plot(self._rows[index])
+
+    def _select_plot(self, row):
         self._plot_selection = (int(row["device_id"]), row["kind"], int(row["point"]))
-        self._load_plot()
+        if self._view_mode == "curve":
+            self._load_plot()
 
     def _clear_plot(self, note):
         self.temperature_plot.clear()
@@ -494,25 +541,31 @@ class HistoryPage(QWidget):
     def export(self, suffix="csv"):
         if self._exporting or self._disposed:
             return
-        try:
-            filters = self._selected_filters()
-        except ValueError as error:
-            self.export_label.setText(f"无法导出：{error}")
+        if self._applied_filters is None:
+            self.export_label.setText("请先完成查询，再导出已应用的筛选范围。")
             return
+        filters = self._applied_filters.copy()
         suffix = "xlsx" if suffix == "xlsx" else "csv"
         title = "导出完整筛选范围为 Excel" if suffix == "xlsx" else "导出完整筛选范围为 CSV"
         file_filter = "Excel 工作簿 (*.xlsx)" if suffix == "xlsx" else "CSV 数据 (*.csv)"
         default = f"历史数据_{datetime.now():%Y%m%d_%H%M%S}.{suffix}"
-        destination, _ = QFileDialog.getSaveFileName(self, title, default, file_filter)
+        destination, _ = QFileDialog.getSaveFileName(
+            self, title, default, file_filter, options=QFileDialog.Option.DontConfirmOverwrite)
         if not destination:
             return
         path = Path(destination)
         if path.suffix.lower() != f".{suffix}":
             path = path.with_suffix(f".{suffix}")
+        if os.path.lexists(path):
+            answer = QMessageBox.question(
+                self, "确认覆盖文件", f"目标文件已存在：{path}\n是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         self._exporting = True
-        self.csv_button.setEnabled(False)
-        self.excel_button.setEnabled(False)
-        self.export_label.setText("正在后台导出完整筛选范围，请等待完成；可继续浏览历史，采集界面仍可操作。")
+        self._update_export_buttons()
+        self.export_label.setText("正在后台导出上次查询的完整范围。")
 
         def done(count):
             if self._disposed:
@@ -530,5 +583,9 @@ class HistoryPage(QWidget):
 
     def _export_finished(self):
         self._exporting = False
-        self.csv_button.setEnabled(True)
-        self.excel_button.setEnabled(True)
+        self._update_export_buttons()
+
+    def _update_export_buttons(self):
+        enabled = self._applied_filters is not None and not self._exporting
+        self.csv_button.setEnabled(enabled)
+        self.excel_button.setEnabled(enabled)

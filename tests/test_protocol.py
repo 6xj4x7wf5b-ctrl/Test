@@ -213,6 +213,87 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(lost["sample"].status, 1)
         self.assertIsNone(lost["sample"].temperature)
 
+    def test_binding_pages_full_table_and_old_single_read(self):
+        first_rom = bytes.fromhex("2C EE 08 64 02 00 EE C9")
+        second_rom = bytes.fromhex("2C EE 49 E1 8A AC 11 64")
+        for point, rom in enumerate((first_rom, second_rom), 1):
+            self.assertEqual(self.maint(3, bytes((1, 0, point, 0)) + rom)["result"], 0)
+        self.assertEqual(self.maint(5)["result"], 0)
+        expected_revision = self.maint(0)["info"]["generation"]
+        records, lengths = [], []
+        for offset in range(0, 170, 20):
+            expected = dict(protocol="maintenance", address=1, op=9,
+                            table=0, offset=offset, limit=20, bus_count=1)
+            frame = self.simulator.simulate_request(build_maintenance(1, 9, struct.pack(">BHB", 0, offset, 20)))
+            for size in range(10):
+                self.assertIsNone(response_length(frame[:size], expected))
+            self.assertEqual(response_length(frame[:10], expected), len(frame))
+            page = parse_response(frame, expected)
+            self.assertEqual((page["table"], page["total"], page["offset"], page["revision"]),
+                             (0, 170, offset, expected_revision))
+            lengths.append(len(frame))
+            records.extend(page["records"])
+        self.assertEqual(lengths, [256] * 8 + [136])
+        self.assertEqual(len({record["rom"] for record in records}), 170)
+        self.assertEqual([record["rom"] for record in records[:2]], [first_rom, second_rom])
+        self.assertEqual((records[-1]["kind"], records[-1]["point"]), ("ambient", 5))
+        self.assertEqual(self.maint(7, b"\x01\x00\x02\x00")["binding"]["rom"], second_rom)
+
+    def test_binding_page_revisions_and_empty_end(self):
+        board = self.simulator.board(1)
+        board.bindings.clear()
+        board.staged.clear()
+        page = lambda table, offset=0: self.maint(9, struct.pack(">BHB", table, offset, 20))
+        empty = page(1)
+        self.assertEqual((empty["total"], empty["records"], len(empty["data"])), (0, [], 10))
+        original_active, original_staged = page(0)["revision"], empty["revision"]
+        key = b"\x01\x00\x01"
+        payload = key + b"\x00" + bytes.fromhex("2CEE08640200EEC9")
+        self.assertEqual(self.maint(3, payload)["result"], 0)
+        self.assertEqual(page(1)["revision"], original_staged + 1)
+        self.assertEqual(page(0)["revision"], original_active)
+        self.assertEqual(self.maint(3, payload)["result"], 0)
+        self.assertEqual(page(1)["revision"], original_staged + 1)
+        self.assertEqual(page(1, 1)["records"], [])
+        self.assertEqual(page(1, 2)["result"], 1)
+        self.assertEqual(self.maint(5)["result"], 0)
+        self.assertEqual((page(0)["revision"], page(1)["revision"]),
+                         (original_active + 1, original_staged + 2))
+        self.assertEqual(self.maint(4, key)["result"], 0)
+        self.assertEqual(page(1)["revision"], original_staged + 3)
+        self.assertEqual(self.maint(6)["result"], 0)
+        self.assertEqual((page(1)["total"], page(1)["revision"]), (1, original_staged + 4))
+
+    def test_binding_page_rejects_invalid_framing_and_records(self):
+        expected = dict(protocol="maintenance", address=1, op=9, table=0, offset=0, limit=20, bus_count=1)
+        for code in (1, 2):
+            old_response = with_crc(bytes((1, 0x41, 9, code)))
+            self.assertEqual(response_length(old_response, expected), 6)
+            self.assertEqual(parse_response(old_response, expected)["result"], code)
+        for payload in (b"", b"\x02\x00\x00\x01", b"\x00\x00\x00\x00", b"\x00\x00\x00\x15"):
+            with self.assertRaises(ProtocolError):
+                build_maintenance(1, 9, payload)
+        header = b"\x01\x41\x09\x00" + struct.pack(">BHHBI", 0, 2, 0, 2, 1)
+        first = b"\x01\x00\x01\x00" + bytes.fromhex("2CEE08640200EEC9")
+        second = b"\x01\x00\x02\x00" + bytes.fromhex("2CEE49E18AAC1164")
+        wire = with_crc(header + first + second)
+        for index, value in ((4, 1), (6, 171), (8, 1), (9, 21), (14, 3), (16, 0), (17, 1)):
+            corrupted = bytearray(wire[:-2])
+            corrupted[index] = value
+            with self.subTest(index=index), self.assertRaises(ProtocolError):
+                parse_response(with_crc(corrupted), expected)
+        invalid_pages = [
+            with_crc(header + first),
+            with_crc(header + first + first),
+            with_crc(header + first + second[:4] + first[4:]),
+            with_crc(header + first[:4] + bytes(8) + second),
+            with_crc(header + first[:-1] + b"\xc8" + second),
+            wire[:-1] + bytes((wire[-1] ^ 1,)),
+        ]
+        for frame in invalid_pages:
+            with self.assertRaises(ProtocolError):
+                parse_response(frame, expected)
+
     def test_profiles_and_board_addresses_are_isolated(self):
         one, two = ProtocolSimulator(), ProtocolSimulator()
         unbind = build_maintenance(1, 4, bytes((1, 0, 1)))

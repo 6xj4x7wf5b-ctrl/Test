@@ -65,7 +65,7 @@ class LivePage(QWidget):
         metrics = QGridLayout()
         metrics.setSpacing(6)
         self.metrics = []
-        metric_titles = ("串口连接", "有效测点", "报警信息", "仓内环境 · ℃ / %RH", "粮温区间", "平均粮温")
+        metric_titles = ("当前分机通信", "有效测点", "报警信息", "仓内环境 · ℃ / %RH", "粮温区间", "平均粮温")
         tones = ("#607b96", "#7b8796", "#92745b", "#5e7fa1", "#947378", "#93816a")
         for i, title in enumerate(metric_titles):
             card = QFrame()
@@ -84,7 +84,7 @@ class LivePage(QWidget):
             self.metrics.append(value)
             metrics.addWidget(card, i // 3, i % 3)
         hero_layout.addLayout(metrics)
-        self.note = QLabel("尚未配置设备。请在“设备与连接”中添加仓房、串口和分机。")
+        self.note = QLabel("尚未配置设备。请在“测温分机管理”中添加仓房、串口和分机。")
         self.note.setObjectName("muted")
         self.note.setWordWrap(True)
         hero_layout.addWidget(self.note)
@@ -154,8 +154,8 @@ class LivePage(QWidget):
         caption = QLabel("功能操作")
         caption.setObjectName("cardTitle")
         console.addWidget(caption)
-        console.addWidget(button("采集粮情", controller.poll, True))
-        console.addWidget(button("刷新状态", controller.poll))
+        console.addWidget(button("采集当前分机一次", self.collect_current, True))
+        console.addWidget(button("查询分机在线状态", self.query_current))
         entries = QGridLayout()
         for i, (text, action) in enumerate((("探头登记", "register"), ("调整布点", "layout"),
                                              ("温湿度微调", "calibration"), ("历史曲线", "history"),
@@ -181,6 +181,16 @@ class LivePage(QWidget):
         self.refresh_timer.setInterval(2000)
         self.refresh_timer.timeout.connect(self.refresh)
         self.refresh_timer.start()
+
+    def collect_current(self):
+        identifier = self.device.currentData()
+        if identifier is not None:
+            self.controller.poll(device_id=identifier)
+
+    def query_current(self):
+        device = self.controller.device(self.device.currentData())
+        if device:
+            self.controller.query_online(device)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -275,7 +285,7 @@ class LivePage(QWidget):
 
     def refresh(self, *_):
         connected = sum(self.controller.manager.is_connected(str(p["id"])) for p in self.controller.metadata["ports"])
-        self.metrics[0].setText(str(connected))
+        self.metrics[0].setText("—")
         identifier = self.device.currentData()
         device = self.controller.device(identifier)
         if not device:
@@ -288,9 +298,10 @@ class LivePage(QWidget):
             self.silo_view.set_snapshot(build_silo_snapshot(None, [], {}, connected=False, stale=False))
             self._clear_matrix()
             self._reflow_matrix()
-            self.note.setText("尚未配置设备。请在“设备与连接”中添加仓房、串口和分机。")
+            self.note.setText("尚未配置设备。请在“测温分机管理”中添加仓房、串口和分机。")
             return
         self.hero_title.setText(f"{device['warehouse_name']} · {device['name']}")
+        self.metrics[0].setText(self.controller.communication_state(device))
         rows = self.controller.latest.get(identifier, [])
         age = time.monotonic() - self.controller.last_received.get(identifier, -1e10)
         stale = age > max(30, 3 * self.controller.timer.interval() / 1000)
@@ -298,26 +309,31 @@ class LivePage(QWidget):
         valid = [r for r in rows if r["status"] == "ok" and not stale and port_connected]
         grain = [r["temp"] for r in valid if r["kind"] == "grain" and r["temp"] is not None]
         ambient = next((r for r in valid if r["kind"] == "ambient"), None)
-        self.metrics[1].setText(f"{len(valid)} / {device['grain_count'] + device['ambient_count']}")
+        self.metrics[1].setText(f"{len(valid)} / {len(self.controller.point_keys(device))}")
         alarm_count = sum(r.get('active', 0) and not r.get('acknowledged_at') for r in self._alarms if r.get('device_id') == identifier)
         self.metrics[2].setText(f"{alarm_count} 条待处理" if alarm_count else "当前无温度预警")
         self.metrics[3].setText(f"{number(ambient['temp'])} / {number(ambient['humidity'])}" if ambient else "— / —")
         self.metrics[4].setText(f"{min(grain):.1f} ～ {max(grain):.1f}℃" if grain else "—")
         self.metrics[5].setText(number(sum(grain) / len(grain), "℃") if grain else "—")
         source = "模拟设备" if device["source"] == "simulator" else "现场设备"
-        state = "已连接" if port_connected else "未连接"
+        state = self.controller.communication_state(device)
         self.note.setText(f"{source} · {device['protocol']} · 地址 {device['address']} · {state}　"
                           "最近接收时间为电脑时间；立体图为线 / 层布点示意，仓温仓湿独立显示。")
         self.console_summary.setText(f"{device['connection_name']}\n分机地址 {device['address']}\n"
-                                     f"粮温 {device['grain_count']} 点 · 仓温湿 {device['ambient_count']} 点\n{source} · {state}")
+                                     f"采集测点 {len(self.controller.point_keys(device))} 个\n{source} · {state}")
         display = []
         for row in rows:
-            state = "连接断开" if not port_connected else "数据过期" if stale else STATUS_NAMES.get(row["status"], row["status"])
+            state = "上次读数 · 连接断开" if not port_connected else "上次读数 · 已过期" if stale else STATUS_NAMES.get(row["status"], row["status"])
             display.append([f"{'粮温' if row['kind'] == 'grain' else '仓温湿'} {row['point']}",
                             self._layout_label(identifier, row), number(row["raw_temp"]), number(row["temp"]),
                             number(row["humidity"]), state, row["timestamp"][11:],
                             "模拟" if row["source"] == "simulator" else "实机"])
         fill_table(self.table, display)
+        if stale or not port_connected:
+            for r in range(self.table.rowCount()):
+                for c in range(self.table.columnCount()):
+                    self.table.item(r, c).setForeground(QColor("#7d8995"))
+                    self.table.item(r, c).setToolTip("这是上次读数，不能代表当前温湿度。")
         self._display_rows = rows
         self.silo_view.set_snapshot(build_silo_snapshot(
             device, rows, self.layouts.get(str(identifier), {}),
@@ -354,7 +370,7 @@ class LivePage(QWidget):
         widget = QTableWidget(0, 4)
         widget.setHorizontalHeaderLabels(["测点", "测温线", "层", "位置名称"])
         widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        keys = [(kind, p) for kind, count in (("grain", device["grain_count"]), ("ambient", device["ambient_count"])) for p in range(1, count + 1)]
+        keys = self.controller.point_keys(device)
         widget.setRowCount(len(keys))
         saved = self.layouts.get(str(identifier), {})
         for i, (kind, point) in enumerate(keys):
@@ -397,7 +413,7 @@ class LivePage(QWidget):
         layout.addWidget(actions)
         if dialog.exec():
             result = dict(self.layouts)
-            result[str(identifier)] = {f"{kind}:{point}": {key: widget.item(i, col).text().strip()
+            result[str(identifier)] = {**saved, **{f"{kind}:{point}": {key: widget.item(i, col).text().strip()
                                       for col, key in enumerate(("line", "layer", "position"), 1)}
-                                      for i, (kind, point) in enumerate(keys)}
+                                      for i, (kind, point) in enumerate(keys)}}
             self.repo.call("set_setting", "point_layouts", result, callback=lambda _: self._layouts_loaded(result))

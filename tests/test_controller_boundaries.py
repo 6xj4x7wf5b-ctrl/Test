@@ -183,14 +183,19 @@ def registration_page(control, monkeypatch):
     monkeypatch.setattr(page, "selected", lambda category: device())
     opened, notices = [], []
 
-    class Dialog:
-        def __init__(self, *args):
-            self.bindings_saved = SimpleNamespace(connect=lambda callback: None)
+    from PySide6.QtWidgets import QDialog
+    from PySide6.QtCore import Signal
 
-        def exec(self):
+    class Dialog(QDialog):
+        bindings_saved = Signal(object)
+        bindings_loaded = Signal(object)
+        def __init__(self, *args, **kwargs):
+            super().__init__(page)
+
+        def show(self):
             opened.append(1)
-            # A second activation while the modal dialog is open is also ignored.
             page.register()
+            super().show()
 
     monkeypatch.setattr(devices_module, "RegistrationDialog", Dialog)
     monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: notices.append(args[-1]))
@@ -216,6 +221,9 @@ def test_repeated_registration_activation_has_one_wait_timer_and_one_dialog(regi
     assert opened == [1]
     assert not timer.isActive()
     assert page._registration_wait is None
+    assert page._registration_active
+    assert "1" in controller.paused
+    page.registration_dialog.reject()
     assert not page._registration_active
     assert "1" not in controller.paused
     assert not notices
@@ -247,4 +255,5 @@ def test_registration_busy_timeout_stops_its_timer_and_releases_pause(registrati
     assert not page._registration_active
     assert page._registration_wait is None
     assert "1" not in controller.paused
-    assert len(notices) == 1 and "尚未完成" in notices[0]
+    assert not notices
+    assert "串口仍忙" in page.registration_hint.text()

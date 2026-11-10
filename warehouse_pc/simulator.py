@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from .domain import crc8, rom_bytes
 from .protocol import (
-    AMBIENT_BASE, AMBIENT_CAPACITY, GRAIN_CAPACITY, STATUS_BASE,
+    AMBIENT_BASE, AMBIENT_CAPACITY, BINDING_PAGE_LIMIT, GRAIN_CAPACITY, STATUS_BASE,
     ProtocolError, crc16, encode_humidity, encode_temperature, with_crc,
 )
 
@@ -38,6 +38,7 @@ class _Board:
     staged: dict[tuple[str, int], tuple[int, bytes]] = field(default_factory=dict)
     faults: dict[tuple[str, int], int] = field(default_factory=dict)
     generation: int = 1
+    staged_revision: int = 1
     dirty: bool = False
     scan_until: float = 0.0
     scan_result: int = 0
@@ -214,6 +215,7 @@ class ProtocolSimulator:
             if board.staged.get(key) != binding:
                 board.staged[key] = binding
                 board.dirty = True
+                board.staged_revision = (board.staged_revision + 1) & 0xFFFFFFFF
             return 0, b""
         if op in (4, 7, 8):
             required = 4 if op == 7 else 3
@@ -227,6 +229,7 @@ class ProtocolSimulator:
                     return 7, b""
                 del board.staged[key]
                 board.dirty = True
+                board.staged_revision = (board.staged_revision + 1) & 0xFFFFFFFF
                 return 0, b""
             if op == 7:
                 table = payload[3]
@@ -241,15 +244,32 @@ class ProtocolSimulator:
         if op == 5 and not payload:
             if board.dirty:
                 board.bindings = board.staged.copy()
-                board.generation += 1
+                board.generation = (board.generation + 1) & 0xFFFFFFFF
+                board.staged_revision = (board.staged_revision + 1) & 0xFFFFFFFF
                 board.dirty = False
                 board.not_ready_until = self.clock() + 0.1
             return 0, b""
         if op == 6 and not payload:
             board.staged = board.bindings.copy()
             board.dirty = False
+            board.staged_revision = (board.staged_revision + 1) & 0xFFFFFFFF
             board.not_ready_until = self.clock() + 0.1
             return 0, b""
+        if op == 9 and len(payload) == 4:
+            table, offset, limit = payload[0], _read16(payload, 1), payload[3]
+            if table not in (0, 1):
+                return 2, b""
+            bindings = board.staged if table else board.bindings
+            if not 1 <= limit <= BINDING_PAGE_LIMIT or offset > len(bindings):
+                return 1, b""
+            revision = board.staged_revision if table else board.generation
+            records = list(bindings.items())[offset:offset + limit]
+            header = bytes((table,)) + _u16(len(bindings)) + _u16(offset) + bytes((len(records),))
+            data = b"".join(
+                bytes((1 if kind == "grain" else 2,)) + _u16(point) + bytes((bus,)) + rom
+                for (kind, point), (bus, rom) in records
+            )
+            return 0, header + revision.to_bytes(4, "big") + data
         return 2, b""
 
     def simulate_request(self, request: bytes, expected: dict[str, Any] | None = None) -> bytes:

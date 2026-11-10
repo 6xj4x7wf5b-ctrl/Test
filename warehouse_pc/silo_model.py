@@ -1,5 +1,6 @@
 """Display-only layer mapping; never changes device numbering or probe bindings."""
 from __future__ import annotations
+from .domain import configured_point_keys
 
 from collections import Counter
 from dataclasses import dataclass
@@ -58,21 +59,22 @@ def build_silo_snapshot(device, rows, layout, *, connected, stale, alarms=()):
     if not device:
         return SiloSnapshot(None, (), "请先选择仓房与分机。", "", 0)
     identifier = device["id"]
-    count = device["grain_count"]
+    grain_points = [point for kind, point in configured_point_keys(device) if kind == "grain"]
+    count = len(grain_points)
     source = device.get("source", "serial")
     if not count:
         return SiloSnapshot(identifier, (), "该分机未配置粮温测点，仓温仓湿见上方环境数据。", source, 0)
     records = layout if isinstance(layout, dict) else {}
     labels = {point: tuple(_label(records.get(f"grain:{point}"), field)
                           for field in ("line", "layer", "position"))
-              for point in range(1, count + 1)}
+              for point in grain_points}
     counts = Counter((line, layer) for line, layer, _ in labels.values() if line and layer)
     readings = {row["point"]: row for row in rows if row.get("kind") == "grain"}
     alarm_points = {row.get("point") for row in alarms
                     if row.get("device_id") == identifier and row.get("kind") == "grain" and row.get("active")}
     located, unplaced = [], []
     conflicts = 0
-    for point in range(1, count + 1):
+    for point in grain_points:
         cable, layer, position = labels[point]
         unique = bool(cable and layer and counts[(cable, layer)] == 1)
         if cable and layer and counts[(cable, layer)] > 1:

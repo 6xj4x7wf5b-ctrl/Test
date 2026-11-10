@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QScrollArea, QStackedWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
+from .domain import configured_point_keys
 
 
 def _label(text: str, name: str = "") -> QLabel:
@@ -307,7 +308,7 @@ class OverviewPage(QWidget):
     def refresh(self, *_):
         rows, stats = self._summaries()
         metadata = self.controller.metadata
-        grain_capacity = sum(row["grain_count"] for row in metadata["devices"])
+        grain_capacity = sum(sum(k == "grain" for k, p in configured_point_keys(row)) for row in metadata["devices"])
         self.metric_values[0].setText(str(len(metadata["warehouses"])))
         self.metric_values[1].setText(str(stats["online"]))
         self.metric_values[2].setText(str(stats["grain_valid"]))

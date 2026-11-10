@@ -14,6 +14,8 @@ from .domain import (
     positive_int, rom_hex, source_for_port, time_range,
 )
 
+_DEVICE_SETTING_PREFIXES = ("binding_sync:", "registration_required:")
+
 
 class Store:
     def __init__(self, path: str | Path):
@@ -144,6 +146,9 @@ class Store:
             if source_for_port(previous[0]) != source_for_port(port_name):
                 raise ValueError("模拟与串口连接不能互相转换，请新建连接和设备以保留来源")
             self._db.execute("UPDATE ports SET name=?,port_name=?,baud=?,parity=?,stop_bits=? WHERE id=?", (name, port_name, baud, parity, stop_bits, id))
+            if previous[0] != port_name:
+                self._db.execute("""DELETE FROM settings WHERE key IN (
+                    SELECT 'binding_sync:' || id FROM devices WHERE port_id=?)""", (id,))
         return id
 
     def delete_port(self, id):
@@ -157,9 +162,17 @@ class Store:
             JOIN warehouses w ON w.id=d.warehouse_id JOIN ports p ON p.id=d.port_id ORDER BY d.id""")
         for row in rows:
             row["source"] = source_for_port(row["port_name"])
+            sync = self.get_setting(f"binding_sync:{row['id']}", {})
+            if not isinstance(sync, dict):
+                sync = {}
+            identity = [row["port_id"], row["port_name"], row["address"]]
+            row["bindings_verified"] = sync.get("identity") == identity
+            row["registration_required"] = bool(self.get_setting(f"registration_required:{row['id']}", False))
+            row["registered_points"] = self.bindings(row["id"]) if row["bindings_verified"] else None
+            row["config_generation"] = sync.get("generation") if row["bindings_verified"] else None
         return rows
 
-    def save_device(self, name, warehouse_id, port_id, address=1, protocol="LC-M3", grain_count=10, ambient_count=1, id=None):
+    def save_device(self, name, warehouse_id, port_id, address=1, protocol="LC-M3", grain_count=10, ambient_count=1, id=None, registration_required=False):
         name = self._name(name, "设备名称")
         positive_int(warehouse_id, "仓房编号")
         positive_int(port_id, "连接编号")
@@ -176,8 +189,13 @@ class Store:
         values = (name, warehouse_id, port_id, address, protocol, grain_count, ambient_count)
         with self._db:
             if id is None:
-                return self._db.execute("""INSERT INTO devices(name,warehouse_id,port_id,address,protocol,grain_count,ambient_count)
+                identifier = self._db.execute("""INSERT INTO devices(name,warehouse_id,port_id,address,protocol,grain_count,ambient_count)
                     VALUES(?,?,?,?,?,?,?)""", values).lastrowid
+                self._clear_device_settings(identifier)
+                if registration_required:
+                    self._db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                     (f"registration_required:{identifier}", "true"))
+                return identifier
             previous = self._device(id)
             target = self._db.execute("SELECT port_name FROM ports WHERE id=?", (port_id,)).fetchone()
             if target is None:
@@ -189,7 +207,13 @@ class Store:
                 if row["point"] > maximum:
                     raise ValueError("新点数小于已有绑定或修正点号，请先处理配置")
             self._db.execute("""UPDATE devices SET name=?,warehouse_id=?,port_id=?,address=?,protocol=?,grain_count=?,ambient_count=? WHERE id=?""", values + (id,))
+            if (port_id, address) != (previous["port_id"], previous["address"]):
+                self._invalidate_binding_sync(id)
         return id
+
+    def _clear_device_settings(self, device_id):
+        self._db.execute("DELETE FROM settings WHERE key IN (?,?)",
+                         tuple(f"{prefix}{device_id}" for prefix in _DEVICE_SETTING_PREFIXES))
 
     def delete_device(self, id):
         self._device(id)
@@ -197,6 +221,7 @@ class Store:
             raise ValueError("设备已有历史或报警记录，不能删除；请保留以便追溯")
         with self._db:
             self._db.execute("DELETE FROM devices WHERE id=?", (id,))
+            self._clear_device_settings(id)
             layouts = self.get_setting("point_layouts", {})
             if isinstance(layouts, dict) and str(id) in layouts:
                 del layouts[str(id)]
@@ -428,13 +453,17 @@ class Store:
               AND newer.point=s.point AND (newer.timestamp>s.timestamp OR
                 (newer.timestamp=s.timestamp AND newer.id>s.id))) ORDER BY s.device_id,s.kind,s.point""", (device_id, device_id))
 
-    def clear_history(self, start=None, end=None, device_id=None, dry_run=False):
+    def clear_history(self, start=None, end=None, device_id=None, dry_run=False, expected_count=None):
         if not isinstance(dry_run, bool):
             raise ValueError("dry_run必须为布尔值")
         where, values = self._history_filter(device_id, start, end)
         with self._db:
+            if not dry_run:
+                self._db.execute("BEGIN IMMEDIATE")
             count = self._db.execute(f"SELECT COUNT(*) FROM samples s WHERE {where}", values).fetchone()[0]
             if not dry_run:
+                if expected_count is not None and count != expected_count:
+                    raise ValueError("确认后记录数发生变化，请重新预览")
                 self._db.execute(f"DELETE FROM samples AS s WHERE {where}", values)
         return count
 
@@ -516,12 +545,16 @@ class Store:
     def get_binding_version(self, device_id):
         return self._device(device_id)["binding_version"]
 
+    def _invalidate_binding_sync(self, device_id):
+        self._db.execute("DELETE FROM settings WHERE key=?", (f"binding_sync:{device_id}",))
+
     def _replace_bindings(self, device_id, rows, version):
         self._db.execute("DELETE FROM bindings WHERE device_id=?", (device_id,))
         self._db.executemany("INSERT INTO bindings(device_id,kind,point,bus,rom,position) VALUES(?,?,?,?,?,?)",
             [(device_id, row["kind"], row["point"], row["bus"], row["rom"], row["position"]) for row in rows])
         self._db.execute("UPDATE devices SET binding_version=? WHERE id=?", (version, device_id))
         self._db.execute("INSERT INTO binding_versions VALUES(?,?,?,?)", (device_id, version, iso_timestamp(), json.dumps(rows, ensure_ascii=False)))
+        self._invalidate_binding_sync(device_id)
 
     def set_bindings(self, device_id, rows):
         device = self._device(device_id)
@@ -546,6 +579,52 @@ class Store:
         with self._db:
             self._replace_bindings(device_id, normalized, device["binding_version"] + 1)
         return device["binding_version"] + 1
+
+    def sync_verified_bindings(self, device_id, rows, generation):
+        """Persist a fully read-back device snapshot without shrinking historical point bounds."""
+        device = self._device(device_id)
+        if isinstance(generation, bool) or not isinstance(generation, int) or not 0 <= generation <= 0xFFFFFFFF:
+            raise ValueError("配置代次应为0到4294967295")
+        if not isinstance(rows, list):
+            raise ValueError("绑定配置必须是列表")
+        old = {(r["kind"], r["point"]): r for r in self.bindings(device_id)}
+        normalized, points, roms = [], set(), set()
+        grain, ambient = device["grain_count"], device["ambient_count"]
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("绑定行必须是对象")
+            kind = normalize_kind(row.get("kind"))
+            point = positive_int(row.get("point"), "测点编号", 165 if kind == "grain" else 5)
+            key = kind, point
+            bus, rom = row.get("bus", 0), rom_hex(row.get("rom"))
+            if isinstance(bus, bool) or not isinstance(bus, int) or not 0 <= bus <= 255:
+                raise ValueError("支路编号无效")
+            if key in points or rom in roms:
+                raise ValueError("绑定测点或传感器编码重复")
+            points.add(key)
+            roms.add(rom)
+            normalized.append(dict(kind=kind, point=point, bus=bus, rom=rom,
+                                   position=old.get(key, {}).get("position", "")))
+            if kind == "grain":
+                grain = max(grain, point)
+            else:
+                ambient = max(ambient, point)
+        normalized.sort(key=lambda r: (r["kind"], r["point"]))
+        previous = [{k: r[k] for k in ("kind", "point", "bus", "rom", "position")} for r in old.values()]
+        self._db.execute("SAVEPOINT binding_sync")
+        try:
+            self._db.execute("UPDATE devices SET grain_count=?,ambient_count=? WHERE id=?", (grain, ambient, device_id))
+            if previous != normalized:
+                self._replace_bindings(device_id, normalized, device["binding_version"] + 1)
+            sync = {"identity": [device["port_id"], device["port_name"], device["address"]], "generation": generation}
+            self._db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                             (f"binding_sync:{device_id}", json.dumps(sync)))
+            self._db.execute("RELEASE binding_sync")
+        except Exception:
+            self._db.execute("ROLLBACK TO binding_sync")
+            self._db.execute("RELEASE binding_sync")
+            raise
+        return len(normalized)
 
     def bump_binding_version(self, device_id):
         device = self._device(device_id)
@@ -624,11 +703,15 @@ class Store:
             backup.close()
 
     def export_config(self):
-        return dict(format="warehouse-pc", version=1, warehouses=self.warehouses(), ports=self.ports(), devices=self.devices(),
+        devices = [{key: value for key, value in row.items()
+                    if key not in {"bindings_verified", "registered_points", "config_generation"}}
+                   for row in self.devices()]
+        return dict(format="warehouse-pc", version=1, warehouses=self.warehouses(), ports=self.ports(), devices=devices,
             calibrations=self._rows("SELECT * FROM calibrations ORDER BY device_id,kind,point"),
             thresholds=self._rows("SELECT * FROM thresholds ORDER BY device_id,kind"),
             bindings=self._rows("SELECT * FROM bindings ORDER BY device_id,kind,point"),
-            settings={row["key"]: json.loads(row["value"]) for row in self._db.execute("SELECT * FROM settings")})
+            settings={row["key"]: json.loads(row["value"]) for row in self._db.execute("SELECT * FROM settings")
+                      if not row["key"].startswith(_DEVICE_SETTING_PREFIXES)})
 
     def _merge_imported_layouts(self, layouts, device_ids):
         if not isinstance(layouts, dict):
@@ -707,8 +790,11 @@ class Store:
                     raise ValueError("导入设备编号重复")
                 port_id = port_ids[row["port_id"]]
                 existing = original.execute("SELECT id FROM devices WHERE port_id=? AND address=?", (port_id, row["address"])).fetchone()
-                device_ids[old_id] = self.save_device(row["name"], warehouse_ids[row["warehouse_id"]], port_id,
+                new_id = self.save_device(row["name"], warehouse_ids[row["warehouse_id"]], port_id,
                     row.get("address", 1), row.get("protocol", "LC-M3"), row.get("grain_count", 10), row.get("ambient_count", 1), existing[0] if existing else None)
+                device_ids[old_id] = new_id
+                if row.get("registration_required") is True:
+                    self.set_setting(f"registration_required:{new_id}", True)
             seen_calibrations, seen_thresholds = set(), set()
             for row in data.get("calibrations", []):
                 key = (row["device_id"], row["kind"], row["point"])
@@ -724,9 +810,13 @@ class Store:
                 self.save_threshold(device_ids[row["device_id"]], row["kind"], row.get("temp_low"), row.get("temp_high"), row.get("humidity_low"), row.get("humidity_high"))
             for old_id, new_id in device_ids.items():
                 self.set_bindings(new_id, [row for row in data.get("bindings", []) if row["device_id"] == old_id])
+                self._invalidate_binding_sync(new_id)
             if any(row["device_id"] not in device_ids for row in data.get("bindings", [])):
                 raise ValueError("绑定配置引用不存在的设备")
             for key, value in data.get("settings", {}).items():
+                key = self._name(key, "设置键")
+                if key.startswith(_DEVICE_SETTING_PREFIXES):
+                    continue
                 if key == "point_layouts":
                     value = self._merge_imported_layouts(value, device_ids)
                 self.set_setting(key, value)
