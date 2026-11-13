@@ -3,20 +3,20 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "warehouse-temperature-console"
+name = "gxht-probe-numbering"
 version = "0.1.0"
-description = "Offline serial desktop console for LC-M3 grain temperature devices"
+description = "Offline single-probe GXHT3W numbering tool"
 requires-python = ">=3.11,<3.13"
-dependencies = ["PySide6>=6.8,<7", "pyqtgraph>=0.13.7,<0.15", "numpy>=1.26,<3", "openpyxl>=3.1,<4"]
+dependencies = ["PySide6>=6.8,<7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pyinstaller>=6,<7"]
 
 [project.scripts]
-warehouse-console = "warehouse_pc.app:main"
+gxht-numbering = "warehouse_numbering.app:main"
 
 [tool.setuptools.packages.find]
-include = ["warehouse_pc*"]
+include = ["warehouse_numbering*", "warehouse_pc*"]
 
 [tool.setuptools.package-data]
 warehouse_pc = ["assets/*.svg"]

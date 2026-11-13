@@ -1,14 +1,7 @@
 __pycache__/
-*.py[cod]
-*.egg-info/
 .pytest_cache/
-.DS_Store
-.venv/
-.venv-windows/
+*.egg-info/
 build/
 dist/
-*.db
-*.db-wal
-*.db-shm
-data/
-screenshots/
+*.db*
+*.log
